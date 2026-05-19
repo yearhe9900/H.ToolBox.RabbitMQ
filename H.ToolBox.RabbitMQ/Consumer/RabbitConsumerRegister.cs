@@ -1,0 +1,416 @@
+﻿using H.ToolBox.RabbitMQ.Model;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using System.Reflection;
+
+namespace H.ToolBox.RabbitMQ.Consumer
+{
+    /// <summary>
+    /// RabbitMQ 消费者注册器
+    /// 负责管理消费者注册的完整生命周期，包括启动、消息处理、健康检查和资源释放
+    /// </summary>
+    /// <remarks>
+    /// 核心职责：
+    /// <list type="bullet">
+    ///   <item><description>通过 <see cref="MethodMatcherCache"/> 扫描并缓存所有消费者方法</description></item>
+    ///   <item><description>为每个消费者方法根据其 <see cref="RabbitMQConsumerAttribute.ConfigId"/> 自动选择对应集群的连接池</description></item>
+    ///   <item><description>创建 <see cref="IRabbitMqConsumerClient"/> 实例并启动监听</description></item>
+    ///   <item><description>根据 <see cref="RabbitMQConsumerAttribute.ListenerCount"/> 启动多个并发消费者实例</description></item>
+    ///   <item><description>注册消息处理回调，通过反射调用目标消费者方法</description></item>
+    ///   <item><description>监控消费者健康状态，支持重启和恢复</description></item>
+    ///   <item><description>在服务停止时优雅地释放所有消费者资源</description></item>
+    /// </list>
+    /// </remarks>
+    public class RabbitConsumerRegister : IRabbitConsumerRegister
+    {
+        /// <summary>
+        /// 日志记录器，用于记录消费者注册、消息处理、错误等信息
+        /// </summary>
+        private readonly ILogger _logger;
+
+        /// <summary>
+        /// 方法匹配缓存，缓存消费者名称到扫描结果的映射关系
+        /// 避免每次启动时重复进行反射扫描，提高性能
+        /// </summary>
+        private MethodMatcherCache _selector = default!;
+
+        /// <summary>
+        /// 服务提供者，用于从 DI 容器中解析服务实例（如 <see cref="MethodMatcherCache"/>）
+        /// </summary>
+        private readonly IServiceProvider _serviceProvider;
+
+        /// <summary>
+        /// 消费者客户端工厂，负责创建和初始化 <see cref="IRabbitMqConsumerClient"/> 实例
+        /// </summary>
+        private readonly IRabbitMqConsumerClientFactory _rabbitMqConsumerClientFactory;
+
+        /// <summary>
+        /// 取消令牌源，用于控制所有消费者实例的停止
+        /// </summary>
+        private CancellationTokenSource _cts = new();
+
+        /// <summary>
+        /// 健康状态锁，保护消费者计数器的线程安全
+        /// </summary>
+        private readonly object _healthLock = new();
+
+        /// <summary>
+        /// 已启动的消费者总数
+        /// </summary>
+        private int _totalConsumers;
+
+        /// <summary>
+        /// 当前健康的消费者数量（已成功注册且未关闭/取消的）
+        /// </summary>
+        private int _healthyConsumers;
+
+        /// <summary>
+        /// 是否0消费者（即没有任何消费者方法被扫描到），用于快速判断是否需要执行重启逻辑
+        /// </summary>
+        private bool _zeroConsumers;
+
+        /// <summary>
+        /// 初始化消费者注册器实例
+        /// </summary>
+        /// <param name="logger">日志记录器</param>
+        /// <param name="serviceProvider">服务提供者，用于解析 DI 容器中的服务</param>
+        /// <param name="rabbitMqConsumerClientFactory">消费者客户端工厂</param>
+        public RabbitConsumerRegister(
+            ILogger<RabbitConsumerRegister> logger,
+            IServiceProvider serviceProvider,
+            IRabbitMqConsumerClientFactory rabbitMqConsumerClientFactory)
+        {
+            _logger = logger;
+            _serviceProvider = serviceProvider;
+            _rabbitMqConsumerClientFactory = rabbitMqConsumerClientFactory;
+        }
+
+        /// <summary>
+        /// 释放资源，取消所有正在运行的消费者并标记为不健康
+        /// </summary>
+        public void Dispose()
+        {
+            lock (_healthLock)
+            {
+                _zeroConsumers = false;
+                _healthyConsumers = 0;
+                _totalConsumers = 0;
+            }
+            _cts.Cancel();
+            _cts.Dispose();
+        }
+
+        /// <summary>
+        /// 检查消费者是否处于健康状态
+        /// 只有当所有已启动的消费者都健康时才返回 true
+        /// </summary>
+        /// <returns>如果所有消费者都健康返回 true，否则返回 false</returns>
+        public bool IsHealthy()
+        {
+            lock (_healthLock)
+            {
+
+                return _zeroConsumers ? true : _totalConsumers > 0 && _healthyConsumers == _totalConsumers;
+            }
+        }
+
+        /// <summary>
+        /// 异步启动消费者注册
+        /// 创建关联的取消令牌源，并通过 <see cref="ExecuteAsync"/> 执行实际的消费者注册逻辑
+        /// </summary>
+        /// <param name="stoppingToken">停止令牌，用于取消操作</param>
+        /// <returns>表示异步启动操作的任务</returns>
+        public async ValueTask StartAsync(CancellationToken stoppingToken)
+        {
+            // 创建关联的取消令牌源，当外部停止令牌触发时自动取消
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+
+            // 注册取消回调，在令牌取消时执行 Dispose 释放资源
+            _cts.Token.Register(Dispose);
+
+            _logger.LogDebug("RabbitMQ消费者注册器正在启动...");
+
+            // 从 DI 容器中获取方法匹配缓存（单例）
+            _selector = _serviceProvider.GetRequiredService<MethodMatcherCache>();
+
+            // 执行消费者注册逻辑
+            await ExecuteAsync();
+        }
+
+        /// <summary>
+        /// 异步重启消费者注册
+        /// 当消费者处于不健康状态或强制重启时，先停止现有消费者再重新启动
+        /// </summary>
+        /// <param name="force">
+        /// 是否强制重启。为 true 时无论健康状态都执行重启；
+        /// 为 false 时仅在消费者不健康时才重启
+        /// </param>
+        /// <returns>表示异步重启操作的任务</returns>
+        public async ValueTask ReStartAsync(bool force = false)
+        {
+            if (!IsHealthy() || force)
+            {
+                // 先停止现有消费者
+                Pulse();
+
+                // 创建新的取消令牌源并重置计数器
+                _cts = new CancellationTokenSource();
+                lock (_healthLock)
+                {
+                    _totalConsumers = 0;
+                    _healthyConsumers = 0;
+                }
+
+                // 重新执行消费者注册
+                await ExecuteAsync();
+            }
+        }
+
+        /// <summary>
+        /// 停止当前所有消费者（脉冲停止）
+        /// 取消并释放当前的取消令牌源，触发所有消费者实例停止
+        /// </summary>
+        public void Pulse()
+        {
+            _cts.Cancel();
+            _cts.Dispose();
+        }
+
+        /// <summary>
+        /// 执行消费者注册的核心逻辑
+        /// 通过方法匹配缓存获取所有消费者方法，为每个方法创建指定数量的消费者客户端并启动监听。
+        /// 每个消费者根据其 <see cref="RabbitMQConsumerAttribute.ConfigId"/> 自动连接到对应的集群。
+        /// </summary>
+        /// <returns>表示异步执行操作的任务</returns>
+        /// <remarks>
+        /// 执行流程：
+        /// <list type="number">
+        ///   <item><description>通过 <see cref="MethodMatcherCache.TrySetExecutor()"/> 获取所有消费者方法</description></item>
+        ///   <item><description>遍历每个消费者方法，根据其 ConfigId 创建对应集群的客户端</description></item>
+        ///   <item><description>根据 <c>ListenerCount</c> 创建指定数量的消费者客户端实例</description></item>
+        ///   <item><description>每个客户端在独立的 Task 中启动监听</description></item>
+        /// </list>
+        /// </remarks>
+        private async ValueTask ExecuteAsync()
+        {
+            // 通过缓存获取所有消费者方法扫描结果
+            var methodScanResults = _selector.TrySetExecutor();
+            if (methodScanResults.IsEmpty)
+            {
+                lock (_healthLock)
+                {
+                    _zeroConsumers = true;
+                }
+            }
+
+            foreach (var methodScanResult in methodScanResults)
+            {
+                var attr = methodScanResult.Value.ConsumerAttribute;
+
+                if (attr == null)
+                    continue;
+
+                // 获取此消费者绑定的集群 ConfigId
+                var configId = attr.ConfigId ?? "default";
+                try
+                {
+                   
+                    // 根据 ListenerCount 创建指定数量的并发消费者实例
+                    for (var i = 0; i < attr.ListenerCount; i++)
+                    {
+                        // 捕获当前 configId 用于闭包
+                        var consumerConfigId = configId;
+
+                        lock (_healthLock)
+                        {
+                            _totalConsumers++;
+                        }
+
+                        // 在独立的 Task 中启动每个消费者实例，避免阻塞注册流程
+                        _ = Task.Factory.StartNew(async () =>
+                        {
+                            try
+                            {
+                                // 使用 using 确保客户端在任务结束时被正确释放
+                                // 通过消费者的 ConfigId 创建对应集群的客户端
+                                await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId);
+
+                                // 注册消息处理和日志回调
+                                RegisterMessageProcessor(client);
+
+                                // 启动消息监听，此方法会阻塞直到取消令牌被触发
+                                await client.ListeningAsync(
+                                    TimeSpan.FromSeconds(attr.WaitOneTimeOut),
+                                    _cts.Token,
+                                    new ListeningOptions()
+                                    {
+                                        ConsumerName = attr.ConsumerName,
+                                        Durable = attr.Durable,
+                                        Exchange = attr.Exchange,
+                                        ExchangeType = attr.ExchangeType,
+                                        PrefetchCount = attr.PrefetchCount,
+                                        QueueName = attr.QueueName,
+                                        RoutingKey = attr.RoutingKey,
+                                        AutoAck = attr.AutoAck,
+                                        ConsumerConcurrent = attr.ConsumerConcurrent
+                                    });
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                // 正常取消，不需要标记为不健康
+                            }
+                            catch (Exception ex)
+                            {
+                                // 消费者任务异常（如连接断开），标记为不健康
+                                lock (_healthLock)
+                                {
+                                    _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
+                                }
+                                _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})", attr.ConsumerName, consumerConfigId);
+                            }
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 记录异常但继续处理其他消费者方法
+                    _logger.LogError(ex, "启动消费者 {ConsumerName} 时发生错误 (ConfigId: {ConfigId})", attr.ConsumerName, configId);
+                    continue;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 处理消费者日志事件
+        /// 根据日志类型更新消费者健康状态并记录相应的日志信息
+        /// </summary>
+        /// <param name="logmsg">日志事件参数，包含日志类型和原因信息</param>
+        private void WriteLog(LogMessageEventArgs logmsg)
+        {
+            switch (logmsg.LogType)
+            {
+                case MqLogType.ConsumerCancelled:
+                    // 消费者被服务器取消，减少健康计数
+                    lock (_healthLock)
+                    {
+                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
+                    }
+                    _logger.LogWarning("RabbitMQ消费者已被取消。 --> {Reason}", logmsg.Reason);
+                    break;
+                case MqLogType.ConsumerRegistered:
+                    // 消费者成功注册，增加健康计数
+                    lock (_healthLock)
+                    {
+                        _healthyConsumers++;
+                    }
+                    _logger.LogInformation("RabbitMQ消费者已注册。 --> {Reason}", logmsg.Reason);
+                    break;
+                case MqLogType.ConsumerUnregistered:
+                    // 消费者取消注册（客户端发起），记录警告日志
+                    _logger.LogWarning("RabbitMQ消费者已取消注册。 --> {Reason}", logmsg.Reason);
+                    break;
+                case MqLogType.ConsumerShutdown:
+                    // 通道关闭，减少健康计数
+                    lock (_healthLock)
+                    {
+                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
+                    }
+                    _logger.LogWarning("RabbitMQ消费者已关闭。 --> {Reason}", logmsg.Reason);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        /// <summary>
+        /// 为消费者客户端注册消息处理回调
+        /// 当消费者收到消息时，通过反射调用目标方法进行业务处理
+        /// </summary>
+        /// <param name="client">消费者客户端实例</param>
+        /// <remarks>
+        /// 消息处理流程：
+        /// <list type="number">
+        ///   <item><description>通过 <see cref="MethodMatcherCache.TryGetExecutor"/> 根据消费者标签查找对应的方法信息</description></item>
+        ///   <item><description>使用反射调用目标方法，传入消息内容和路由键作为参数</description></item>
+        ///   <item><description>如果目标方法返回 Task，则等待其完成</description></item>
+        ///   <item><description>处理成功后调用 <see cref="IRabbitMqConsumerClient.CommitAsync"/> 确认消息</description></item>
+        ///   <item><description>处理失败时记录错误日志并调用 <see cref="IRabbitMqConsumerClient.RejectAsync"/> 拒绝消息</description></item>
+        /// </list>
+        /// </remarks>
+        private void RegisterMessageProcessor(IRabbitMqConsumerClient client)
+        {
+            // 注册日志回调
+            client.OnLogCallback = WriteLog;
+
+            // 注册消息处理回调
+            client.OnMessageCallback = async (message, sender, consumerTag) =>
+            {
+                try
+                {
+                    // 根据消费者标签（consumerTag）查找对应的方法执行器
+                    var canFindSubscriber = _selector.TryGetExecutor(consumerTag, out var executor);
+                    if (canFindSubscriber)
+                    {
+                        if (executor == null)
+                            return;
+
+                        var instance = executor.Instance;
+                        var methodInfo = executor.MethodInfo;
+                        try
+                        {
+                            // 构造方法参数：[消息内容, 路由键]
+#if NET10_0_OR_GREATER
+                            object?[] invokeParams = [message.BodyContent, message.RoutingKey];
+#else
+                            object?[] invokeParams = new object?[] { message.BodyContent, message.RoutingKey };
+#endif
+                            // 通过反射调用目标消费者方法
+                            var result = methodInfo!.Invoke(instance, invokeParams);
+                            var canCommit = true;
+
+                            // 根据返回类型处理结果，用于决定消息确认或拒绝
+                            if (result is Task<bool> boolTask)
+                            {
+                                canCommit = await boolTask;
+                            }
+                            else if (result is Task taskResult)
+                            {
+                                await taskResult;
+                            }
+                            else if (result is bool boolResult)
+                            {
+                                canCommit = boolResult;
+                            }
+
+                            // 根据处理结果决定确认或拒绝消息
+                            if (canCommit)
+                            {
+                                await client.CommitAsync(sender);
+                            }
+                            else
+                            {
+                                await client.RejectAsync(sender);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "处理消息时发生异常");
+                            await client.RejectAsync(sender);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError("未找到消费者方法执行器，无法处理消息。 --> {ConsumerTag}", consumerTag);
+                        await client.RejectAsync(sender);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 消息处理失败，记录错误并拒绝消息（消息将被重新入队）
+                    _logger.LogError(ex, "处理消息时发生异常");
+                    await client.RejectAsync(sender);
+                }
+            };
+        }
+    }
+}

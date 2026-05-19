@@ -1,0 +1,30 @@
+﻿using RabbitMQ.Client;
+
+namespace H.ToolBox.RabbitMQ.Channel
+{
+    /// <summary>
+    /// 连接通道池接口
+    /// </summary>
+    /// <remarks>老版本的MQ客户端会出现大量作废channel无法释放的问题，这次采用通道池的概念，解决这个问题</remarks>
+    public interface IConnectionChannelPool
+    {
+        /// <summary>
+        /// 获取RabbitMQ连接实例
+        /// </summary>
+        /// <returns>RabbitMQ连接对象</returns>
+        IConnection GetConnection();
+
+        /// <summary>
+        /// 从通道池中租借一个可用的RabbitMQ通道
+        /// </summary>
+        /// <returns>可用的RabbitMQ通道</returns>
+        Task<IChannel> Rent();
+
+        /// <summary>
+        /// 归还通道到通道池中以供复用
+        /// </summary>
+        /// <param name="context">要归还的RabbitMQ通道</param>
+        /// <returns>归还是否成功（true表示成功回收到池中，false表示通道被释放）</returns>
+        bool Return(IChannel context);
+    }
+}

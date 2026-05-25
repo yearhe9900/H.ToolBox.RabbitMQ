@@ -21,7 +21,7 @@ H.ToolBox.RabbitMQ/
 
 | 层 | 组件 | 说明 |
 |---|---|---|
-| **连接池** | `ConnectionChannelPool` | 管理单集群的 RabbitMQ 连接和通道复用 |
+| **连接池** | `ConnectionChannelPool` | 管理单集群的 RabbitMQ 连接和通道复用，SemaphoreSlim 异步租借，支持空闲回收和声明缓存 |
 | **连接池管理** | `ConnectionChannelPoolManager` | 管理多集群连接池，按 `ConfigId` 路由 |
 | **消费者扫描** | `ConsumerServiceSelector` | 反射扫描 `IToolBoxRabbitMQ` 实现类中的 `[RabbitMQConsumer]` 标记方法 |
 | **方法缓存** | `MethodMatcherCache` | 缓存 ConsumerName → 方法映射，启动时校验唯一性 |
@@ -87,7 +87,10 @@ H.ToolBox.RabbitMQ/
       "UserName": "guest",
       "Password": "guest",
       "VirtualHost": "/",
-      "PublishConfirms": true
+      "PublishConfirms": true,
+      "PoolSize": 15,
+      "MinPoolSize": 2,
+      "IdleTimeout": "00:01:00"
     },
     {
       "ConfigId": "cluster2",
@@ -137,6 +140,14 @@ builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 60);
 // 不开启健康检查
 builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 0);
 ```
+
+通道池配置（在 `RabbitMQOptions` 中设置）：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `PoolSize` | 15 | 最大并发通道数量 |
+| `MinPoolSize` | 0 | 空闲回收时至少保留的通道数 |
+| `IdleTimeout` | 60 秒 | 通道空闲超时时间，`TimeSpan.Zero` 禁用回收 |
 
 ### 3. 创建消费者
 
@@ -298,7 +309,7 @@ public class ConsumerWorker : BackgroundService
 原有的 `AddRabbitMQ(options => { ... })` 单集群注册方式完全兼容，不破坏现有代码。
 
 ### 🏊 连接通道池复用
-`ConnectionChannelPool` 使用 `ConcurrentQueue` 管理通道复用，避免频繁创建销毁通道，线程安全，支持最大通道数限制和发布确认模式。
+`ConnectionChannelPool` 使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用，避免频繁创建销毁通道。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（最大通道数）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）配置，高峰自动扩容，闲时自动收缩。
 
 ### 📡 自动声明与绑定
 消费者启动时自动声明队列/交换机并绑定（交换机模式），设置 QoS 预取数量，开发者无需关心基础设施初始化。

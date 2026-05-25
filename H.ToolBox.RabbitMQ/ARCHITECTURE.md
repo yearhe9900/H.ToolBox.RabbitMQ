@@ -27,7 +27,8 @@ H.ToolBox.RabbitMQ/
 │   │
 │   ├── Channel/                                       # ── 连接通道池 ──
 │   │   ├── IConnectionChannelPool.cs                  #   连接通道池接口
-│   │   ├── ConnectionChannelPool.cs                   #   连接通道池实现 (单集群连接管理)
+│   │   ├── ConnectionChannelPool.cs                   #   连接通道池实现 (SemaphoreSlim + 空闲回收)
+│   │   ├── CachedDeclareChannel.cs                    #   声明缓存装饰器 (跳过重复 ExchangeDeclare/QueueDeclare)
 │   │   ├── IConnectionChannelPoolManager.cs           #   连接通道池管理器接口 (多集群)
 │   │   └── ConnectionChannelPoolManager.cs            #   连接通道池管理器实现 (多集群)
 │   │
@@ -204,16 +205,26 @@ classDiagram
     }
 
     class ConnectionChannelPool {
-        -ConcurrentQueue _pool
+        -ConcurrentQueue~(IChannel,long)~ _pool
+        -SemaphoreSlim _semaphore
         -IConnection _connection
-        -int _count
         -int _maxSize
-        -Func _connectionActivator
-        -bool _isPublishConfirms
+        -int _minSize
+        -long _idleTimeoutTicks
+        -Timer _sweepTimer
         +GetConnection() IConnection
-        +Rent() Task
+        +Rent(CancellationToken) Task
         +Return(IChannel) bool
         +Dispose() void
+    }
+
+    class CachedDeclareChannel {
+        -ConditionalWeakTable~IChannel,HashSet~ s_caches
+        -IChannel _channel
+        -HashSet~string~ _declared
+        +ExchangeDeclareAsync(...) Task
+        +QueueDeclareAsync(...) Task
+        +BasicPublishAsync(...) ValueTask
     }
 
     class ConnectionChannelPoolManager {
@@ -254,6 +265,9 @@ classDiagram
         +VirtualHost string
         +ClientProvidedName string
         +PublishConfirms bool
+        +PoolSize int
+        +MinPoolSize int
+        +IdleTimeout TimeSpan
         +ConsumerThreadCount int
         +ConnectionFactoryOptions Action~ConnectionFactory~
     }
@@ -306,7 +320,9 @@ classDiagram
     ConnectionChannelPoolManager ..> RabbitMQOptions : 按ConfigId注册
     RabbitMqTransport ..|> IRabbitMqTransport
     RabbitMqTransport --> IConnectionChannelPoolManager : 按ConfigId路由
+    RabbitMqTransport ..> CachedDeclareChannel : 声明缓存
     RabbitMqTransport ..> TransportMessage : 使用
+    CachedDeclareChannel ..> IChannel : 装饰
     IToolBoxRabbitMQ <|.. TestClass : 实现
 ```
 
@@ -389,25 +405,27 @@ sequenceDiagram
 sequenceDiagram
     participant Worker as Worker.cs
     participant Transport as RabbitMqTransport
+    participant Cached as CachedDeclareChannel
     participant PoolMgr as ConnectionChannelPoolManager
-    participant Pool1 as Pool (default)
-    participant Pool2 as Pool (cluster2)
-    participant MQ1 as RabbitMQ Server (default)
-    participant MQ2 as RabbitMQ Server (cluster2)
+    participant Pool as Pool (default)
+    participant MQ as RabbitMQ Server
 
     Worker->>Transport: SendAsync(ConfigId="default", Queue="q1")
     Transport->>PoolMgr: GetPool("default")
-    PoolMgr-->>Transport: Pool1
-    Transport->>Pool1: Rent()
-    Transport->>MQ1: BasicPublishAsync(...)
-    Transport->>Pool1: Return(channel)
-
-    Worker->>Transport: SendAsync(ConfigId="cluster2", Queue="q2")
-    Transport->>PoolMgr: GetPool("cluster2")
-    PoolMgr-->>Transport: Pool2
-    Transport->>Pool2: Rent()
-    Transport->>MQ2: BasicPublishAsync(...)
-    Transport->>Pool2: Return(channel)
+    PoolMgr-->>Transport: Pool
+    Transport->>Pool: Rent(cancellationToken)
+    Pool-->>Transport: channel (SemaphoreSlim 异步等待)
+    Transport->>Cached: new CachedDeclareChannel(channel)
+    alt 首次发送到 q1
+        Cached->>MQ: QueueDeclareAsync("q1") ← 网络往返
+        Note over Cached: 缓存 "q|q1|True"
+    else 再次发送到 q1
+        Note over Cached: 缓存命中，跳过声明 ← 零开销
+    end
+    Transport->>Cached: BasicPublishAsync("q1", body)
+    Cached->>MQ: BasicPublishAsync(...) ← 始终执行
+    Transport->>Pool: Return(channel, timestamp)
+    Note over Pool: 定时器扫描空闲超时通道并回收
 ```
 
 ---
@@ -454,8 +472,9 @@ graph LR
 
 | 类 | 职责 |
 |---|---|
-| `IConnectionChannelPool` | 定义连接和通道的获取/归还接口 |
-| `ConnectionChannelPool` | 管理单一 RabbitMQ 连接，维护通道池（`ConcurrentQueue<IChannel>`），支持通道租借与归还，控制最大通道数（默认15），支持发布确认模式 |
+| `IConnectionChannelPool` | 定义连接和通道的获取/归还接口，`Rent` 支持 `CancellationToken` |
+| `ConnectionChannelPool` | 管理单一 RabbitMQ 连接，使用 `SemaphoreSlim` 实现异步通道租借（替代旧版 `lock+SpinWait` 忙等），`ConcurrentQueue<(IChannel, long)>` 管理通道复用与归还时间戳，支持最大通道数（`PoolSize` 默认15）、最小保留数（`MinPoolSize`）、空闲超时回收（`IdleTimeout` 默认60秒，定时器每30秒扫描）、发布确认模式 |
+| `CachedDeclareChannel` | 声明缓存装饰器，通过 `ConditionalWeakTable` 给 `IChannel` 附加 `HashSet<string>` 缓存，对同一 exchange/queue 的 `DeclareAsync` 只执行一次，后续跳过，减少发布时的网络往返 |
 | `IConnectionChannelPoolManager` | 连接通道池管理器接口，通过 `GetPool(configId)` 获取指定集群的连接通道池 |
 | `ConnectionChannelPoolManager` | 管理多个集群的连接通道池（`ConcurrentDictionary<string, IConnectionChannelPool>`），支持 `RegisterPool` 注册和 `GetPool` 获取 |
 
@@ -482,7 +501,7 @@ graph LR
 
 | 类 | 职责 |
 |---|---|
-| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`ConnectionFactoryOptions` 自定义工厂配置 |
+| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`PoolSize` 最大通道数（默认15）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
 | `MethodMatcherCache` | 方法匹配缓存，`TrySetExecutor()` 校验 ConsumerName 唯一性（重复则抛异常），`TrySetExecutor(configId)` 按集群筛选 |
 | `RabbitMQConsumerAttribute` | 消费者特性，含 `ConfigId` 指定消费者绑定的集群、`WaitOneTimeOut` 轮询超时、`ConsumerConcurrent` 并发处理级别 |
 
@@ -506,7 +525,8 @@ graph LR
 | **反射扫描** | `ConsumerServiceSelector` | 运行时扫描带特性的方法，自动注册消费者 |
 | **方法缓存** | `MethodMatcherCache` | 缓存消费者名称到方法信息的映射，校验唯一性 |
 | **工厂模式** | `RabbitMqConsumerClientFactory` | 按 ConfigId 创建对应集群的客户端 |
-| **对象池模式** | `ConnectionChannelPool` | ConcurrentQueue 管理通道复用 |
+| **对象池模式** | `ConnectionChannelPool` | SemaphoreSlim + ConcurrentQueue 管理通道异步租借与复用，支持空闲超时自动回收 |
+| **装饰器模式** | `CachedDeclareChannel` | 给 IChannel 附加声明缓存，跳过重复的 ExchangeDeclare/QueueDeclare 网络往返 |
 | **管理器模式** | `ConnectionChannelPoolManager` | 管理多个集群的连接池，按 ConfigId 路由 |
 | **后台服务** | `Bootstrapper` / `Worker` | BackgroundService 实现后台任务 |
 | **回调/委托** | `OnMessageCallback` / `OnLogCallback` | 事件驱动的消息处理和生命周期日志 |
@@ -527,7 +547,10 @@ graph LR
       "HostName": ["192.168.1.100"],
       "Port": 5672,
       "UserName": "guest",
-      "Password": "guest"
+      "Password": "guest",
+      "PoolSize": 15,
+      "MinPoolSize": 2,
+      "IdleTimeout": "00:01:00"
     },
     {
       "ConfigId": "cluster2",

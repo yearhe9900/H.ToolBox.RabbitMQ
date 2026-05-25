@@ -17,8 +17,9 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// <summary>
         /// 从通道池中租借一个可用的RabbitMQ通道
         /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
         /// <returns>可用的RabbitMQ通道</returns>
-        Task<IChannel> Rent();
+        Task<IChannel> Rent(CancellationToken cancellationToken = default);
 
         /// <summary>
         /// 归还通道到通道池中以供复用

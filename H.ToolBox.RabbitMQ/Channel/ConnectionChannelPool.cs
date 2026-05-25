@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using System.Collections.Concurrent;
 using System.Reflection;
+using System.Threading;
 
 namespace H.ToolBox.RabbitMQ.Channel
 {
@@ -13,13 +14,10 @@ namespace H.ToolBox.RabbitMQ.Channel
     public class ConnectionChannelPool : IConnectionChannelPool, IDisposable
     {
         /// <summary>
-        /// 定义一个默认通道池大小，默认值为15，实际使用中可以根据需要进行调整
+        /// 默认通道池大小
         /// </summary>
         private const int DefaultPoolSize = 15;
 
-        /// <summary>
-        /// 定义一个对象锁，用于在多线程环境中保护对连接通道池的访问，确保线程安全
-        /// </summary>
 #if NET10_0_OR_GREATER
         private static readonly Lock SLock = new();
 #else
@@ -48,19 +46,20 @@ namespace H.ToolBox.RabbitMQ.Channel
         private readonly ConcurrentQueue<IChannel> _pool;
 
         /// <summary>
+        /// 使用 SemaphoreSlim 替代 lock + Thread.SpinWait，支持真正的异步等待，
+        /// 避免高并发下线程阻塞和 CPU 空转
+        /// </summary>
+        private readonly SemaphoreSlim _semaphore;
+
+        /// <summary>
+        /// 最大池大小
+        /// </summary>
+        private readonly int _maxSize;
+
+        /// <summary>
         /// 当前MQ连接
         /// </summary>
         private IConnection? _connection;
-
-        /// <summary>
-        /// 当前通道池中已创建的通道数量，初始值为0，每当创建一个新的通道时，这个计数器会增加，当通道被释放时，这个计数器会减少，以确保不超过最大池大小
-        /// </summary>
-        private int _count;
-
-        /// <summary>
-        /// 最大池大小，表示通道池中允许存在的最大通道数量，默认值为15，可以通过构造函数或配置文件进行调整，以适应不同的应用需求
-        /// </summary>
-        private int _maxSize;
 
         /// <summary>
         /// 连接通道池（通过 IOptions 注入）
@@ -84,8 +83,9 @@ namespace H.ToolBox.RabbitMQ.Channel
             RabbitMQOptions options)
         {
             _logger = logger;
-            _maxSize = DefaultPoolSize;
+            _maxSize = options.PoolSize > 0 ? options.PoolSize : DefaultPoolSize;
             _pool = new ConcurrentQueue<IChannel>();
+            _semaphore = new SemaphoreSlim(_maxSize, _maxSize);
 
             _connectionActivator = CreateConnection(options);
             _isPublishConfirms = options.PublishConfirms;
@@ -167,109 +167,83 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// </summary>
         public void Dispose()
         {
-            // 第一步，将最大值归0，防止在释放过程中有新的通道被创建，造成的内存泄露问题
-            _maxSize = 0;
+            // 释放信号量，阻止新的租借请求
+            _semaphore.Dispose();
 
-            // 第二步，释放通道池中的所有通道实例，使用TryDequeue方法从通道池中逐个取出通道实例，并调用Dispose方法释放它们，确保所有资源都被正确清理
+            // 释放通道池中的所有通道实例
             while (_pool.TryDequeue(out var channel))
             {
                 channel.Dispose();
             }
 
-            // 第三步，释放MQ连接，检查当前的连接实例是否不为null，如果存在，则调用Dispose方法释放连接资源，确保所有与MQ服务器的连接都被正确关闭
+            // 释放MQ连接
             _connection?.Dispose();
         }
 
         /// <summary>
-        /// 租借一个通道（显式接口实现）
-        /// 此方法通过锁机制确保在多线程环境下对通道数量的控制
+        /// 租借一个通道
+        /// 使用 SemaphoreSlim 进行异步等待，当通道池满时线程会挂起让出 CPU，
+        /// 而非 lock + Thread.SpinWait 的忙等模式，大幅降低高并发下的 CPU 消耗和线程争用
         /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
         /// <returns>返回一个可用的RabbitMQ通道</returns>
-        Task<IChannel> IConnectionChannelPool.Rent()
+        async Task<IChannel> IConnectionChannelPool.Rent(CancellationToken cancellationToken)
         {
-            // 使用静态锁对象确保线程安全，防止多个线程同时创建过多通道
-            lock (SLock)
+            // 异步等待信号量，当池中所有通道都在使用中时，调用线程会被挂起（不占用 CPU），
+            // 直到有通道被归还释放信号量，或 CancellationToken 被取消
+            await _semaphore.WaitAsync(cancellationToken);
+
+            try
             {
-                // 当当前通道数量超过最大池大小时，进行自旋等待
-                // Thread.SpinWait(1) 是一种轻量级的等待方式，适用于短时间等待场景
-                // 这样可以避免频繁创建新通道，控制资源使用
-                while (_count > _maxSize)
+                // 优先复用池中的已有通道（ConcurrentQueue.TryDequeue 是线程安全的）
+                if (_pool.TryDequeue(out var model))
                 {
-                    Thread.SpinWait(1);
+                    return model;
                 }
 
-                // 当通道数量在允许范围内时，调用实际的租借逻辑
-                return Rent();
+                // 池中无可用通道，创建新通道
+                return await GetConnection().CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken);
+            }
+            catch
+            {
+                // 通道获取失败（创建异常或连接断开），释放信号量槽位避免泄漏
+                _semaphore.Release();
+                throw;
             }
         }
 
         /// <summary>
-        /// 租借通道的核心实现
-        /// 优先从通道池中获取可用通道，如果池中没有可用通道则创建新通道
+        /// 租借通道的核心实现（同步兼容，供内部或遗留代码使用）
         /// </summary>
         /// <returns>返回一个可用的RabbitMQ通道</returns>
         public virtual async Task<IChannel> Rent()
         {
-            // 尝试从通道池中获取一个已存在的可用通道
-            // 如果成功，减少计数器并返回该通道，实现通道复用
-            if (_pool.TryDequeue(out var model))
-            {
-                // 使用原子操作减少计数器，确保线程安全
-                // 注意：这里减少计数是因为从池中取出的通道将被使用，不再属于"可用"状态
-                Interlocked.Decrement(ref _count);
-                return model;
-            }
-
-            // 如果通道池中没有可用通道，则创建新的通道
-            try
-            {
-                // 通过当前连接创建新的通道
-                // CreateChannelOptions参数说明：
-                // - 第一个参数：是否启用发布确认模式
-                // - 第二个参数：是否自动关闭通道（false表示手动管理）
-                model = await GetConnection().CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false));
-            }
-            catch (Exception e)
-            {
-                // 记录通道创建失败的日志，便于问题排查
-                _logger.LogError(e, "RabbitMQ 通道创建失败");
-                // 重新抛出异常，让调用方处理
-                throw;
-            }
-
-            // 返回新创建的通道
-            return model;
+            return await ((IConnectionChannelPool)this).Rent();
         }
 
         /// <summary>
         /// 归还通道到池中
-        /// 将使用完毕的通道归还到通道池以便复用，如果池已满或通道已关闭则释放该通道
+        /// 将使用完毕的通道归还到通道池以便复用，如果通道已关闭则释放该通道
         /// </summary>
         /// <param name="channel">要归还的RabbitMQ通道</param>
         /// <returns>归还是否成功（true表示成功回收到池中，false表示通道被释放）</returns>
         public bool Return(IChannel channel)
         {
-            // 原子性地增加计数器，检查是否超过最大池大小
-            // 如果未超过且通道仍处于打开状态，则将通道回收到池中
-            if (Interlocked.Increment(ref _count) <= _maxSize && channel.IsOpen)
+            // 通道关闭不可复用，直接释放并归还信号量槽位
+            if (!channel.IsOpen)
             {
-                // 将通道加入线程安全的队列中，供后续租借使用
-                _pool.Enqueue(channel);
-
-                return true;
+                channel.Dispose();
+                _semaphore.Release();
+                return false;
             }
 
-            // 以下情况会执行通道释放：
-            // 1. 通道池已满（计数器超过最大值）
-            // 2. 通道已经关闭，无法复用
-            
-            // 释放通道资源，避免内存泄漏
-            channel.Dispose();
+            // 将可用通道放回池中
+            _pool.Enqueue(channel);
 
-            // 由于通道未被回收到池中，需要减少计数器以保持计数准确
-            Interlocked.Decrement(ref _count);
+            // 归还信号量槽位，唤醒等待中的 Rent 调用
+            _semaphore.Release();
 
-            return false;
+            return true;
         }
     }
 }

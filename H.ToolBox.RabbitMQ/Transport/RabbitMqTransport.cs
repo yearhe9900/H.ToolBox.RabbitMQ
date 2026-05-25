@@ -85,17 +85,20 @@ namespace H.ToolBox.RabbitMQ.Transport
             try
             {
                 // 从连接通道池中租借一个可用通道
-                channel = await connectionChannelPool.Rent();
+                channel = await connectionChannelPool.Rent(cancellationToken);
+
+                // 用 CachedDeclareChannel 包装，对同一个 exchange/queue 的声明操作自动跳过
+                var cached = new CachedDeclareChannel(channel);
 
                 if (hasExchangeMode)
                 {
-                    // 交换机模式：先声明交换机（幂等操作，已存在则跳过），再通过交换机发布消息
-                    await channel.ExchangeDeclareAsync(message.Exchange, message.ExchangeType, message.Durable ?? _durable, false, null, false, cancellationToken);
+                    // 交换机模式：首次声明后缓存，后续同参数调用直接跳过
+                    await cached.ExchangeDeclareAsync(message.Exchange, message.ExchangeType, message.Durable ?? _durable, cancellationToken);
                 }
                 else
                 {
-                    // 队列模式：先声明队列（幂等操作），后续通过默认交换机（""）+ 队列名路由发布
-                    await channel.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, false, false, null, false, cancellationToken);
+                    // 队列模式：首次声明后缓存，后续同参数调用直接跳过
+                    await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, cancellationToken);
 
                     // 队列模式下若未指定 RoutingKey，则使用队列名作为 RoutingKey
                     // 默认交换机会将 RoutingKey 与队列名完全匹配的消息路由到对应队列
@@ -113,7 +116,7 @@ namespace H.ToolBox.RabbitMQ.Transport
 
                 // 发布消息
                 // mandatory: false 表示消息无法路由时直接丢弃，不返回给发布者
-                await channel.BasicPublishAsync(
+                await cached.BasicPublishAsync(
                     exchange: message.Exchange,
                     routingKey: message.RoutingKey,
                     mandatory: false,

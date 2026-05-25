@@ -53,6 +53,11 @@ namespace H.ToolBox.RabbitMQ.Model
         public bool PublishConfirms { get; set; } = true;
 
         /// <summary>
+        /// 通道池大小，控制最大并发通道数量，默认值为15
+        /// </summary>
+        public int PoolSize { get; set; } = 15;
+
+        /// <summary>
         /// 消费者线程数，控制并发消费的并行度
         /// </summary>
         public int ConsumerThreadCount { get; set; } = 1;

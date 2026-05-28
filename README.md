@@ -89,6 +89,7 @@ H.ToolBox.RabbitMQ/
       "VirtualHost": "/",
       "PublishConfirms": true,
       "PoolSize": 15,
+      "AbsoluteMaxPoolSize": 128,
       "MinPoolSize": 2,
       "IdleTimeout": "00:01:00"
     },
@@ -145,7 +146,8 @@ builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 0);
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `PoolSize` | 15 | 最大并发通道数量 |
+| `PoolSize` | 15 | 初始并发通道数量 |
+| `AbsoluteMaxPoolSize` | 128 | 动态扩展上限，信号量满时自动翻倍扩容，设为0或负数则禁止动态扩展 |
 | `MinPoolSize` | 0 | 空闲回收时至少保留的通道数 |
 | `IdleTimeout` | 60 秒 | 通道空闲超时时间，`TimeSpan.Zero` 禁用回收 |
 
@@ -309,7 +311,7 @@ public class ConsumerWorker : BackgroundService
 原有的 `AddRabbitMQ(options => { ... })` 单集群注册方式完全兼容，不破坏现有代码。
 
 ### 🏊 连接通道池复用
-`ConnectionChannelPool` 使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用，避免频繁创建销毁通道。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（最大通道数）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）配置，高峰自动扩容，闲时自动收缩。
+`ConnectionChannelPool` 使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用，避免频繁创建销毁通道。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（初始通道数）、`AbsoluteMaxPoolSize`（动态扩展上限，信号量满时 CAS 无锁翻倍扩容）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）配置，高峰自动扩容，闲时自动收缩。`OperationCanceledException` 直接向上传播，不被包装为发布失败异常。
 
 ### 📡 自动声明与绑定
 消费者启动时自动声明队列/交换机并绑定（交换机模式），设置 QoS 预取数量，开发者无需关心基础设施初始化。

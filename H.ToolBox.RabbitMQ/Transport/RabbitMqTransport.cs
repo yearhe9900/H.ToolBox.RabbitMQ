@@ -126,6 +126,11 @@ namespace H.ToolBox.RabbitMQ.Transport
 
                 return OperateResult.Success;
             }
+            catch (OperationCanceledException)
+            {
+                // 取消是正常的控制流，不需要包装，直接向上传播
+                throw;
+            }
             catch (Exception ex)
             {
                 // 通道已关闭但状态标记不一致（IsOpen 仍为 true）时，强制释放该通道以避免资源泄漏

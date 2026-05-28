@@ -27,7 +27,6 @@ namespace H.ToolBox.RabbitMQ.Application
         public async Task<bool> TestQueue(string source, string routingKey)
         {
             Console.WriteLine($"[default]A TestQueue called with name: {source}, routing key: {routingKey},time：{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")}");
-            await Task.Delay(1000);
             Console.WriteLine($"[default]B TestQueue called with name: {source}, routing key: {routingKey},time：{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")}");
             return true;
         }

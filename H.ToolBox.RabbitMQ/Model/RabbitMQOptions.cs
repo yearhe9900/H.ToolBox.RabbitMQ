@@ -53,9 +53,26 @@ namespace H.ToolBox.RabbitMQ.Model
         public bool PublishConfirms { get; set; } = true;
 
         /// <summary>
-        /// 通道池大小，控制最大并发通道数量，默认值为15
+        /// 通道池初始大小，控制初始并发通道数量，默认值为15
         /// </summary>
         public int PoolSize { get; set; } = 15;
+
+        /// <summary>
+        /// 通道池绝对上限，动态扩展时不超过此值，默认值为128。
+        /// 设置为0或负数时，自动取 PoolSize 值（即禁止动态扩展）。
+        /// </summary>
+        public int AbsoluteMaxPoolSize { get; set; } = 128;
+
+        /// <summary>
+        /// 通道池最小保留数量，空闲回收时不会低于此值，默认值为0（不保留）
+        /// </summary>
+        public int MinPoolSize { get; set; } = 0;
+
+        /// <summary>
+        /// 通道空闲超时时间，超过此时间未被使用的通道将被自动回收，默认60秒
+        /// 设置为 TimeSpan.Zero 可禁用空闲回收
+        /// </summary>
+        public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
         /// <summary>
         /// 消费者线程数，控制并发消费的并行度

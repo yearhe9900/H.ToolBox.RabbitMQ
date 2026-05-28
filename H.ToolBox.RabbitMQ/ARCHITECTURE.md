@@ -208,7 +208,8 @@ classDiagram
         -ConcurrentQueue~(IChannel,long)~ _pool
         -SemaphoreSlim _semaphore
         -IConnection _connection
-        -int _maxSize
+        -int _currentMaxSize
+        -int _absoluteMaxSize
         -int _minSize
         -long _idleTimeoutTicks
         -Timer _sweepTimer
@@ -266,6 +267,7 @@ classDiagram
         +ClientProvidedName string
         +PublishConfirms bool
         +PoolSize int
+        +AbsoluteMaxPoolSize int
         +MinPoolSize int
         +IdleTimeout TimeSpan
         +ConsumerThreadCount int
@@ -473,7 +475,7 @@ graph LR
 | 类 | 职责 |
 |---|---|
 | `IConnectionChannelPool` | 定义连接和通道的获取/归还接口，`Rent` 支持 `CancellationToken` |
-| `ConnectionChannelPool` | 管理单一 RabbitMQ 连接，使用 `SemaphoreSlim` 实现异步通道租借（替代旧版 `lock+SpinWait` 忙等），`ConcurrentQueue<(IChannel, long)>` 管理通道复用与归还时间戳，支持最大通道数（`PoolSize` 默认15）、最小保留数（`MinPoolSize`）、空闲超时回收（`IdleTimeout` 默认60秒，定时器每30秒扫描）、发布确认模式 |
+| `ConnectionChannelPool` | 管理单一 RabbitMQ 连接，使用 `SemaphoreSlim` 实现异步通道租借（替代旧版 `lock+SpinWait` 忙等），`ConcurrentQueue<(IChannel, long)>` 管理通道复用与归还时间戳，支持初始通道数（`PoolSize` 默认15）、动态扩展上限（`AbsoluteMaxPoolSize` 默认128，信号量满时通过 CAS 无锁翻倍扩容）、最小保留数（`MinPoolSize`）、空闲超时回收（`IdleTimeout` 默认60秒，定时器每30秒扫描）、发布确认模式 |
 | `CachedDeclareChannel` | 声明缓存装饰器，通过 `ConditionalWeakTable` 给 `IChannel` 附加 `HashSet<string>` 缓存，对同一 exchange/queue 的 `DeclareAsync` 只执行一次，后续跳过，减少发布时的网络往返 |
 | `IConnectionChannelPoolManager` | 连接通道池管理器接口，通过 `GetPool(configId)` 获取指定集群的连接通道池 |
 | `ConnectionChannelPoolManager` | 管理多个集群的连接通道池（`ConcurrentDictionary<string, IConnectionChannelPool>`），支持 `RegisterPool` 注册和 `GetPool` 获取 |
@@ -494,14 +496,14 @@ graph LR
 
 | 类 | 职责 |
 |---|---|
-| `RabbitMqTransport` | 消息发布实现，通过 `IConnectionChannelPoolManager` 按 `TransportMessage.ConfigId` 路由到对应集群的连接池发送消息。提供三种发送方式：`SendAsync(TransportMessage)` 底层方法、`SendAsync<T>(configId, queueName, msg)` 队列模式便捷方法、`SendAsync<T>(configId, exchange, routingKey, msg)` 交换机模式便捷方法 |
+| `RabbitMqTransport` | 消息发布实现，通过 `IConnectionChannelPoolManager` 按 `TransportMessage.ConfigId` 路由到对应集群的连接池发送消息。提供三种发送方式：`SendAsync(TransportMessage)` 底层方法、`SendAsync<T>(configId, queueName, msg)` 队列模式便捷方法、`SendAsync<T>(configId, exchange, routingKey, msg)` 交换机模式便捷方法。`OperationCanceledException` 直接向上传播，不包装为 `PublisherSentFailedException` |
 | `TransportMessage` | 消息传输对象（struct），新增 `ConfigId` 属性（默认 `"default"`），指定消息发送到哪个集群 |
 
 ### 6.4 Model（数据模型层）
 
 | 类 | 职责 |
 |---|---|
-| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`PoolSize` 最大通道数（默认15）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
+| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`PoolSize` 初始通道数（默认15）、`AbsoluteMaxPoolSize` 动态扩展上限（默认128）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
 | `MethodMatcherCache` | 方法匹配缓存，`TrySetExecutor()` 校验 ConsumerName 唯一性（重复则抛异常），`TrySetExecutor(configId)` 按集群筛选 |
 | `RabbitMQConsumerAttribute` | 消费者特性，含 `ConfigId` 指定消费者绑定的集群、`WaitOneTimeOut` 轮询超时、`ConsumerConcurrent` 并发处理级别 |
 
@@ -525,7 +527,7 @@ graph LR
 | **反射扫描** | `ConsumerServiceSelector` | 运行时扫描带特性的方法，自动注册消费者 |
 | **方法缓存** | `MethodMatcherCache` | 缓存消费者名称到方法信息的映射，校验唯一性 |
 | **工厂模式** | `RabbitMqConsumerClientFactory` | 按 ConfigId 创建对应集群的客户端 |
-| **对象池模式** | `ConnectionChannelPool` | SemaphoreSlim + ConcurrentQueue 管理通道异步租借与复用，支持空闲超时自动回收 |
+| **对象池模式** | `ConnectionChannelPool` | SemaphoreSlim + ConcurrentQueue 管理通道异步租借与复用，支持 CAS 无锁动态扩展（`AbsoluteMaxPoolSize` 上限）、空闲超时自动回收 |
 | **装饰器模式** | `CachedDeclareChannel` | 给 IChannel 附加声明缓存，跳过重复的 ExchangeDeclare/QueueDeclare 网络往返 |
 | **管理器模式** | `ConnectionChannelPoolManager` | 管理多个集群的连接池，按 ConfigId 路由 |
 | **后台服务** | `Bootstrapper` / `Worker` | BackgroundService 实现后台任务 |
@@ -549,6 +551,7 @@ graph LR
       "UserName": "guest",
       "Password": "guest",
       "PoolSize": 15,
+      "AbsoluteMaxPoolSize": 128,
       "MinPoolSize": 2,
       "IdleTimeout": "00:01:00"
     },

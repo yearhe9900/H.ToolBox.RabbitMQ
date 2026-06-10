@@ -1,4 +1,6 @@
+using H.ToolBox.RabbitMQ.Model;
 using RabbitMQ.Client;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace H.ToolBox.RabbitMQ.Channel
@@ -40,12 +42,12 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// <summary>
         /// 声明队列（幂等缓存，同参数只声明一次）
         /// </summary>
-        public async Task QueueDeclareAsync(string queue, bool durable, CancellationToken cancellationToken)
+        public async Task QueueDeclareAsync(string queue, bool durable, QueueType queueType, IDictionary<string, object?>? arguments, CancellationToken cancellationToken)
         {
-            var key = $"q|{queue}|{durable}";
+            var key = $"q|{queue}|{durable}|{queueType}";
             if (!_declared.Add(key)) return;
 
-            await _channel.QueueDeclareAsync(queue, durable, false, false, null, false, cancellationToken);
+            await _channel.QueueDeclareAsync(queue, durable, false, false, arguments, false, cancellationToken);
         }
 
         /// <summary>

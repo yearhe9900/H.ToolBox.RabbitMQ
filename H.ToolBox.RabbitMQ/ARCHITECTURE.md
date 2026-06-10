@@ -77,7 +77,6 @@ H.ToolBox.RabbitMQ/
 
 ```mermaid
 classDiagram
-    direction TB
 
     %% ── 接口层 ──
     class IToolBoxRabbitMQ {
@@ -205,7 +204,7 @@ classDiagram
     }
 
     class ConnectionChannelPool {
-        -ConcurrentQueue~(IChannel,long)~ _pool
+        -ConcurrentQueue _pool
         -SemaphoreSlim _semaphore
         -IConnection _connection
         -int _currentMaxSize
@@ -220,7 +219,7 @@ classDiagram
     }
 
     class CachedDeclareChannel {
-        -ConditionalWeakTable~IChannel,HashSet~ s_caches
+        -ConditionalWeakTable s_caches
         -IChannel _channel
         -HashSet~string~ _declared
         +ExchangeDeclareAsync(...) Task

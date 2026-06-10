@@ -1,4 +1,5 @@
 using H.ToolBox.RabbitMQ.Channel;
+using H.ToolBox.RabbitMQ.Model;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
@@ -59,6 +60,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="exclusive">队列是否为独占队列，默认为 false</param>
         /// <param name="autoDelete">队列是否自动删除，默认为 false</param>
         /// <param name="consumerTag">消费者标签，默认为空</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <param name="cancellationToken">取消令牌，用于停止消费</param>
         /// <returns>表示异步消费操作的任务（此任务会持续运行直到取消）</returns>
         public async Task ListenAsync<T>(
@@ -71,6 +74,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             bool exclusive = false,
             bool autoDelete = false,
             string consumerTag = "",
+            QueueType queueType = QueueType.Classic,
+            int? quorumGroupSize = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(queueName))
@@ -82,13 +87,15 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
             await TrackChannelAsync(channel);
 
-            // 声明队列
+            // 声明队列（根据队列类型构建参数）
+            var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
+
             await channel.QueueDeclareAsync(
                 queue: queueName,
                 durable: durable,
                 exclusive: exclusive,
                 autoDelete: autoDelete,
-                arguments: null,
+                arguments: queueArguments,
                 cancellationToken: cancellationToken);
 
             // 设置 QoS
@@ -169,6 +176,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="exclusive">队列是否为独占队列，默认为 false</param>
         /// <param name="autoDelete">队列是否自动删除，默认为 false</param>
         /// <param name="consumerTag">消费者标签，默认为空</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <param name="cancellationToken">取消令牌，用于停止消费</param>
         /// <returns>表示异步消费操作的任务（此任务会持续运行直到取消）</returns>
         public async Task ListenByExchangeAsync<T>(
@@ -184,6 +193,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             bool exclusive = false,
             bool autoDelete = false,
             string consumerTag = "",
+            QueueType queueType = QueueType.Classic,
+            int? quorumGroupSize = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(exchange))
@@ -206,13 +217,15 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 arguments: null,
                 cancellationToken: cancellationToken);
 
-            // 声明队列
+            // 声明队列（根据队列类型构建参数）
+            var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
+
             await channel.QueueDeclareAsync(
                 queue: queueName,
                 durable: durable,
                 exclusive: exclusive,
                 autoDelete: autoDelete,
-                arguments: null,
+                arguments: queueArguments,
                 cancellationToken: cancellationToken);
 
             // 绑定队列到交换机

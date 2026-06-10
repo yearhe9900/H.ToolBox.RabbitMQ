@@ -1,4 +1,5 @@
 ﻿using H.ToolBox.RabbitMQ.Model;
+using System.Collections.Generic;
 
 namespace H.ToolBox.RabbitMQ
 {
@@ -91,5 +92,18 @@ namespace H.ToolBox.RabbitMQ
         /// 当值大于 0 时，使用信号量控制并发数量，消息在独立的 Task 中并行处理
         /// </summary>
         public byte ConsumerConcurrent { get; set; } = 1;
+
+        /// <summary>
+        /// 获取或设置队列类型，默认为 Classic（经典队列）
+        /// 设置为 Quorum 可使用仲裁队列，适用于集群模式下需要高可用的场景
+        /// 此设置会覆盖 <see cref="RabbitMQOptions.DefaultQueueType"/> 全局默认值
+        /// </summary>
+        public QueueType QueueType { get; set; } = QueueType.Classic;
+
+        /// <summary>
+        /// 获取或设置仲裁队列初始组大小（副本数），仅当 QueueType 为 Quorum 时生效
+        /// 设置为 0 表示使用 <see cref="RabbitMQOptions.QuorumGroupSize"/> 或 RabbitMQ 服务器默认值
+        /// </summary>
+        public int QuorumGroupSize { get; set; }
     }
 }

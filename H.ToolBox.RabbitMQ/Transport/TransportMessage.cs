@@ -1,4 +1,5 @@
 using H.ToolBox.RabbitMQ.Model;
+using System.Collections.Generic;
 
 namespace H.ToolBox.RabbitMQ.Transport
 {
@@ -14,6 +15,8 @@ namespace H.ToolBox.RabbitMQ.Transport
         public TransportMessage(ReadOnlyMemory<byte> body)
         {
             Body = body;
+            QueueType = QueueType.Classic;
+            QuorumGroupSize = null;
         }
 
         /// <summary>
@@ -46,6 +49,18 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 获取或设置队列是否持久化（可选）
         /// </summary>
         public bool? Durable { get; set; } = true;
+
+        /// <summary>
+        /// 获取或设置队列类型，默认为 Classic（经典队列）
+        /// 设置为 Quorum 可使用仲裁队列
+        /// </summary>
+        public QueueType QueueType { get; set; } = QueueType.Classic;
+
+        /// <summary>
+        /// 获取或设置仲裁队列初始组大小，仅当 QueueType 为 Quorum 时生效
+        /// null 表示使用全局配置或服务器默认值
+        /// </summary>
+        public int? QuorumGroupSize { get; set; }
 
         /// <summary>
         /// 获取消息体的原始字节内容

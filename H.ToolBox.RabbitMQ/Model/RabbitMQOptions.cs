@@ -80,6 +80,20 @@ namespace H.ToolBox.RabbitMQ.Model
         public int ConsumerThreadCount { get; set; } = 1;
 
         /// <summary>
+        /// 默认队列类型，控制新声明队列的类型。
+        /// Classic 为经典队列（默认），Quorum 为仲裁队列（推荐集群模式使用）。
+        /// 可在 <see cref="RabbitMQConsumerAttribute.QueueType"/> 中针对单个消费者覆盖此设置。
+        /// </summary>
+        public QueueType DefaultQueueType { get; set; } = QueueType.Classic;
+
+        /// <summary>
+        /// 仲裁队列初始组大小（副本数），仅当队列类型为 Quorum 时生效。
+        /// 设置为 null 表示使用 RabbitMQ 服务器默认值（通常为 3）。
+        /// 建议设置为奇数（如 3、5），且不超过集群节点数。
+        /// </summary>
+        public int? QuorumGroupSize { get; set; }
+
+        /// <summary>
         /// 连接工厂自定义配置回调
         /// 允许对 <see cref="ConnectionFactory"/> 进行额外的个性化设置（如SSL、超时时间等）
         /// </summary>

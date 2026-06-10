@@ -3,6 +3,7 @@ using H.ToolBox.RabbitMQ.Model;
 using H.ToolBox.RabbitMQ.Transport;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System.Collections.Generic;
 using System.Text;
 
 namespace H.ToolBox.RabbitMQ.Consumer
@@ -129,6 +130,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
             var queueName = options.QueueName;
             var consumerConcurrent = options.ConsumerConcurrent ;
 
+            // 根据队列类型构建声明参数
+            var queueArguments = QueueArgumentsHelper.BuildArguments(options.QueueType, options.QuorumGroupSize);
+
             if (isExchangeMode)
             {
                 // Exchange 模式：声明交换机，队列绑定由外部配置完成
@@ -147,7 +151,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     options.Durable,
                     false,
                     false,
-                    null);
+                    queueArguments);
                 queueName = queueDeclareOk.QueueName;
             }
 

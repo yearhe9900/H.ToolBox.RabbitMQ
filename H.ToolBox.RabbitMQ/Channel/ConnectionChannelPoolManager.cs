@@ -11,6 +11,7 @@ namespace H.ToolBox.RabbitMQ.Channel
     public class ConnectionChannelPoolManager : IConnectionChannelPoolManager, IDisposable
     {
         private readonly ConcurrentDictionary<string, IConnectionChannelPool> _pools = new();
+        private readonly ConcurrentDictionary<string, RabbitMQOptions> _options = new();
         private readonly ILogger<ConnectionChannelPool> _poolLogger;
 
         /// <summary>
@@ -40,6 +41,22 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
+        /// 根据 ConfigId 获取对应的 RabbitMQ 配置选项
+        /// </summary>
+        /// <param name="configId">集群配置标识，默认为 "default"</param>
+        /// <returns>对应集群的配置选项</returns>
+        /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
+        public RabbitMQOptions GetOptions(string configId = "default")
+        {
+            if (_options.TryGetValue(configId, out var options))
+            {
+                return options;
+            }
+
+            throw new KeyNotFoundException($"未找到 ConfigId 为 '{configId}' 的集群配置选项，请确保已通过 AddRabbitMQ 注册该集群配置。");
+        }
+
+        /// <summary>
         /// 注册指定 ConfigId 的连接通道池
         /// </summary>
         /// <param name="configId">集群配置标识</param>
@@ -59,6 +76,8 @@ namespace H.ToolBox.RabbitMQ.Channel
                 pool.Dispose();
                 throw new InvalidOperationException($"ConfigId 为 '{configId}' 的连接通道池已注册，不可重复注册。");
             }
+
+            _options.TryAdd(configId, options);
 
             return pool;
         }

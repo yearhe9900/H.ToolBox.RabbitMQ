@@ -1,4 +1,5 @@
-﻿using H.ToolBox.RabbitMQ.Model;
+﻿using H.ToolBox.RabbitMQ.Channel;
+using H.ToolBox.RabbitMQ.Model;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
@@ -45,14 +46,29 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private readonly IRabbitMqConsumerClientFactory _rabbitMqConsumerClientFactory;
 
         /// <summary>
+        /// 连接通道池管理器，用于获取集群配置选项
+        /// </summary>
+        private readonly IConnectionChannelPoolManager _poolManager;
+
+        /// <summary>
         /// 取消令牌源，用于控制所有消费者实例的停止
         /// </summary>
-        private CancellationTokenSource _cts = new();
+        private CancellationTokenSource? _cts = new();
 
         /// <summary>
         /// 健康状态锁，保护消费者计数器的线程安全
         /// </summary>
         private readonly object _healthLock = new();
+
+        /// <summary>
+        /// CTS 操作锁，保护 _cts 字段的读写和 Dispose 重入
+        /// </summary>
+        private readonly object _ctsLock = new();
+
+        /// <summary>
+        /// 标识是否已释放资源
+        /// </summary>
+        private bool _disposed;
 
         /// <summary>
         /// 已启动的消费者总数
@@ -75,29 +91,58 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="logger">日志记录器</param>
         /// <param name="serviceProvider">服务提供者，用于解析 DI 容器中的服务</param>
         /// <param name="rabbitMqConsumerClientFactory">消费者客户端工厂</param>
+        /// <param name="poolManager">连接通道池管理器</param>
         public RabbitConsumerRegister(
             ILogger<RabbitConsumerRegister> logger,
             IServiceProvider serviceProvider,
-            IRabbitMqConsumerClientFactory rabbitMqConsumerClientFactory)
+            IRabbitMqConsumerClientFactory rabbitMqConsumerClientFactory,
+            IConnectionChannelPoolManager poolManager)
         {
             _logger = logger;
             _serviceProvider = serviceProvider;
             _rabbitMqConsumerClientFactory = rabbitMqConsumerClientFactory;
+            _poolManager = poolManager;
         }
 
         /// <summary>
-        /// 释放资源，取消所有正在运行的消费者并标记为不健康
+        /// 停止所有消费者并重置健康状态，但不释放 CTS 资源
+        /// 此方法可安全地从 CTS 取消回调中调用（不会产生重入问题）
+        /// </summary>
+        private void StopConsumers()
+        {
+            CancellationTokenSource cts;
+            lock (_ctsLock)
+            {
+                if (_cts is null) return;
+                cts = _cts;
+            }
+            // 在锁外调用 Cancel，避免回调重入时死锁
+            cts.Cancel();
+        }
+
+        /// <summary>
+        /// 释放资源，取消所有正在运行的消费者并释放 CTS
+        /// 通过 _disposed 标志防止重入（CTS 取消回调会触发此方法）
         /// </summary>
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
+
             lock (_healthLock)
             {
                 _zeroConsumers = false;
                 _healthyConsumers = 0;
                 _totalConsumers = 0;
             }
-            _cts.Cancel();
-            _cts.Dispose();
+
+            StopConsumers();
+
+            lock (_ctsLock)
+            {
+                _cts?.Dispose();
+                _cts = null;
+            }
         }
 
         /// <summary>
@@ -122,11 +167,14 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步启动操作的任务</returns>
         public async ValueTask StartAsync(CancellationToken stoppingToken)
         {
-            // 创建关联的取消令牌源，当外部停止令牌触发时自动取消
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            lock (_ctsLock)
+            {
+                // 创建关联的取消令牌源，当外部停止令牌触发时自动取消
+                _cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
 
-            // 注册取消回调，在令牌取消时执行 Dispose 释放资源
-            _cts.Token.Register(Dispose);
+                // 注册取消回调，在令牌取消时停止消费者（不释放 CTS，避免重入）
+                _cts.Token.Register(StopConsumers);
+            }
 
             _logger.LogDebug("RabbitMQ消费者注册器正在启动...");
 
@@ -148,17 +196,17 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步重启操作的任务</returns>
         public async ValueTask ReStartAsync(bool force = false)
         {
+            if (_disposed) return;
+
             if (!IsHealthy() || force)
             {
                 // 先停止现有消费者
                 Pulse();
 
-                // 创建新的取消令牌源并重置计数器
-                _cts = new CancellationTokenSource();
-                lock (_healthLock)
+                // 创建新的取消令牌源
+                lock (_ctsLock)
                 {
-                    _totalConsumers = 0;
-                    _healthyConsumers = 0;
+                    _cts = new CancellationTokenSource();
                 }
 
                 // 重新执行消费者注册
@@ -168,12 +216,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
         /// <summary>
         /// 停止当前所有消费者（脉冲停止）
-        /// 取消并释放当前的取消令牌源，触发所有消费者实例停止
+        /// 取消当前的取消令牌源，触发所有消费者实例停止
         /// </summary>
         public void Pulse()
         {
-            _cts.Cancel();
-            _cts.Dispose();
+            StopConsumers();
         }
 
         /// <summary>
@@ -193,6 +240,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// </remarks>
         private async ValueTask ExecuteAsync()
         {
+            CancellationTokenSource cts;
+            lock (_ctsLock)
+            {
+                if (_cts is null || _disposed) return;
+                cts = _cts;
+            }
+
             // 通过缓存获取所有消费者方法扫描结果
             var methodScanResults = _selector.TrySetExecutor();
             if (methodScanResults.IsEmpty)
@@ -241,7 +295,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                 // 启动消息监听，此方法会阻塞直到取消令牌被触发
                                 await client.ListeningAsync(
                                     TimeSpan.FromSeconds(attr.WaitOneTimeOut),
-                                    _cts.Token,
+                                    cts.Token,
                                     new ListeningOptions()
                                     {
                                         ConsumerName = attr.ConsumerName,
@@ -252,7 +306,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                         QueueName = attr.QueueName,
                                         RoutingKey = attr.RoutingKey,
                                         AutoAck = attr.AutoAck,
-                                        ConsumerConcurrent = attr.ConsumerConcurrent
+                                        ConsumerConcurrent = attr.ConsumerConcurrent,
+                                        QueueType = attr.QueueType,
+                                        QuorumGroupSize = attr.QuorumGroupSize > 0
+                                            ? attr.QuorumGroupSize
+                                            : _poolManager.GetOptions(consumerConfigId).QuorumGroupSize,
                                     });
                             }
                             catch (OperationCanceledException)

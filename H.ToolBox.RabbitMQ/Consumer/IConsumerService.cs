@@ -1,3 +1,4 @@
+using H.ToolBox.RabbitMQ.Model;
 using RabbitMQ.Client;
 
 namespace H.ToolBox.RabbitMQ.Consumer
@@ -36,6 +37,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="exclusive">队列是否为独占队列，默认为 false</param>
         /// <param name="autoDelete">队列是否自动删除（当所有消费者断开后），默认为 false</param>
         /// <param name="consumerTag">消费者标签，用于标识消费者，默认为空（由 RabbitMQ 自动生成）</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <param name="cancellationToken">取消令牌，用于停止消费</param>
         /// <returns>表示异步消费操作的任务（此任务会持续运行直到取消）</returns>
         Task ListenAsync<T>(
@@ -48,6 +51,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             bool exclusive = false,
             bool autoDelete = false,
             string consumerTag = "",
+            QueueType queueType = QueueType.Classic,
+            int? quorumGroupSize = null,
             CancellationToken cancellationToken = default);
 
         /// <summary>
@@ -70,6 +75,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="exclusive">队列是否为独占队列，默认为 false</param>
         /// <param name="autoDelete">队列是否自动删除（当所有消费者断开后），默认为 false</param>
         /// <param name="consumerTag">消费者标签，用于标识消费者，默认为空（由 RabbitMQ 自动生成）</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <param name="cancellationToken">取消令牌，用于停止消费</param>
         /// <returns>表示异步消费操作的任务（此任务会持续运行直到取消）</returns>
         Task ListenByExchangeAsync<T>(
@@ -85,6 +92,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             bool exclusive = false,
             bool autoDelete = false,
             string consumerTag = "",
+            QueueType queueType = QueueType.Classic,
+            int? quorumGroupSize = null,
             CancellationToken cancellationToken = default);
     }
 }

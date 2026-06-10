@@ -28,9 +28,11 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="queueName">目标队列名称，同时作为路由键使用</param>
         /// <param name="msg">待发送的消息对象，将被 JSON 序列化</param>
         /// <param name="durable">队列是否持久化，默认为 true，持久化队列在 RabbitMQ 重启后不会丢失</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
-        Task<OperateResult> SendAsync<T>(string configId, string queueName, T msg, bool? durable = true, CancellationToken cancellationToken = default) where T : class;
+        Task<OperateResult> SendAsync<T>(string configId, string queueName, T msg, bool? durable = true, QueueType queueType = QueueType.Classic, int? quorumGroupSize = null, CancellationToken cancellationToken = default) where T : class;
 
         /// <summary>
         /// 以交换机模式发送消息（泛型便捷方法）。

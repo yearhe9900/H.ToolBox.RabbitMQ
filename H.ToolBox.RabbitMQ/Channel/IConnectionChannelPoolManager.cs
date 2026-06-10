@@ -1,3 +1,5 @@
+using H.ToolBox.RabbitMQ.Model;
+
 namespace H.ToolBox.RabbitMQ.Channel
 {
     /// <summary>
@@ -13,5 +15,13 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// <returns>对应集群的连接通道池</returns>
         /// <exception cref="KeyOutOfRangeException">当指定的 ConfigId 未注册时抛出</exception>
         IConnectionChannelPool GetPool(string configId = "default");
+
+        /// <summary>
+        /// 根据 ConfigId 获取对应的 RabbitMQ 配置选项
+        /// </summary>
+        /// <param name="configId">集群配置标识，默认为 "default"</param>
+        /// <returns>对应集群的配置选项</returns>
+        /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
+        RabbitMQOptions GetOptions(string configId = "default");
     }
 }

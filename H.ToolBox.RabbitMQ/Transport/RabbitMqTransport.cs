@@ -89,7 +89,7 @@ namespace H.ToolBox.RabbitMQ.Transport
 
                 // 用 CachedDeclareChannel 包装，对同一个 exchange/queue 的声明操作自动跳过
                 var cached = new CachedDeclareChannel(channel);
-
+                              
                 if (hasExchangeMode)
                 {
                     // 交换机模式：首次声明后缓存，后续同参数调用直接跳过
@@ -97,8 +97,11 @@ namespace H.ToolBox.RabbitMQ.Transport
                 }
                 else
                 {
+                    // 队列模式：根据队列类型构建声明参数
+                    var queueArguments = QueueArgumentsHelper.BuildArguments(message.QueueType, message.QuorumGroupSize);
+
                     // 队列模式：首次声明后缓存，后续同参数调用直接跳过
-                    await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, cancellationToken);
+                    await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, message.QueueType, queueArguments, cancellationToken);
 
                     // 队列模式下若未指定 RoutingKey，则使用队列名作为 RoutingKey
                     // 默认交换机会将 RoutingKey 与队列名完全匹配的消息路由到对应队列
@@ -114,6 +117,8 @@ namespace H.ToolBox.RabbitMQ.Transport
                     DeliveryMode = DeliveryModes.Persistent,
                 };
 
+
+
                 // 发布消息
                 // mandatory: false 表示消息无法路由时直接丢弃，不返回给发布者
                 await cached.BasicPublishAsync(
@@ -122,7 +127,8 @@ namespace H.ToolBox.RabbitMQ.Transport
                     mandatory: false,
                     basicProperties: props,
                     body: message.Body,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken
+                    );
 
                 return OperateResult.Success;
             }
@@ -186,8 +192,10 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="queueName">目标队列名称，同时作为路由键</param>
         /// <param name="msg">待发送的消息对象</param>
         /// <param name="durable">队列是否持久化，默认为 true</param>
+        /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
+        /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
         /// <returns>操作结果</returns>
-        public async Task<OperateResult> SendAsync<T>(string configId, string queueName, T msg, bool? durable = true, CancellationToken cancellationToken = default) where T : class
+        public async Task<OperateResult> SendAsync<T>(string configId, string queueName, T msg, bool? durable = true, QueueType queueType = QueueType.Classic, int? quorumGroupSize = null, CancellationToken cancellationToken = default) where T : class
         {
             ReadOnlyMemory<byte> body = CreateMessageBody(msg);
 
@@ -196,6 +204,8 @@ namespace H.ToolBox.RabbitMQ.Transport
                 ConfigId = configId,
                 QueueName = queueName,
                 Durable = durable,
+                QueueType = queueType,
+                QuorumGroupSize = quorumGroupSize,
             };
 
             return await SendAsync(message, cancellationToken);

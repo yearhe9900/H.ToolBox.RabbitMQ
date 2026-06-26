@@ -1,9 +1,10 @@
 using H.ToolBox.RabbitMQ.Channel;
 using H.ToolBox.RabbitMQ.Model;
+using H.ToolBox.RabbitMQ.Serializer;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
-using System.Text.Json;
 
 namespace H.ToolBox.RabbitMQ.Consumer
 {
@@ -18,6 +19,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// 连接通道池管理器，用于根据 ConfigId 获取对应集群的连接通道池
         /// </summary>
         private readonly IConnectionChannelPoolManager _poolManager;
+
+        /// <summary>
+        /// 消息序列化器
+        /// </summary>
+        private readonly IMessageSerializer _serializer;
+
+        private readonly ILogger<ConsumerService> _logger;
 
         /// <summary>
         /// 当前持有的 RabbitMQ 通道列表，用于资源释放时关闭所有通道
@@ -38,9 +46,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// 初始化消费者服务实例
         /// </summary>
         /// <param name="poolManager">连接通道池管理器</param>
-        public ConsumerService(IConnectionChannelPoolManager poolManager)
+        /// <param name="serializer">消息序列化器</param>
+        public ConsumerService(IConnectionChannelPoolManager poolManager, IMessageSerializer serializer, ILogger<ConsumerService> logger)
         {
             _poolManager = poolManager;
+            _serializer = serializer;
+            _logger = logger;
         }
 
         /// <summary>
@@ -82,10 +93,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 throw new ArgumentException("队列名称不能为空。", nameof(queueName));
 
             var pool = _poolManager.GetPool(configId);
-            var connection = pool.GetConnection();
-            var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+            var connection = await pool.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            await TrackChannelAsync(channel);
+            await TrackChannelAsync(channel).ConfigureAwait(false);
 
             // 声明队列（根据队列类型构建参数）
             var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
@@ -96,43 +107,58 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 exclusive: exclusive,
                 autoDelete: autoDelete,
                 arguments: queueArguments,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 设置 QoS
             await channel.BasicQosAsync(
                 prefetchSize: 0,
                 prefetchCount: prefetchCount,
                 global: false,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 创建异步事件消费者并注册 ReceivedAsync 回调
             var consumer = new AsyncEventingBasicConsumer(channel);
             consumer.ReceivedAsync += async (sender, ea) =>
             {
                 var bodyString = Encoding.UTF8.GetString(ea.Body.Span);
-                var body = DeserializeBody<T>(ea.Body.Span);
+                T body;
+                try
+                {
+                    body = _serializer.Deserialize<T>(ea.Body.Span);
+                }
+                catch (Exception ex)
+                {
+                    // 反序列化失败：消息格式不可恢复，拒绝并不再重入队列，避免无限重试
+                    _logger.LogError(ex, "消息反序列化失败，消息将被丢弃。Queue: {Queue}", queueName);
+                    if (!autoAck)
+                    {
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    return;
+                }
                 var routingKey = ea.RoutingKey ?? string.Empty;
 
                 try
                 {
-                    var success = await allwaysRunActionTask(body, bodyString, routingKey);
+                    var success = await allwaysRunActionTask(body, bodyString, routingKey).ConfigureAwait(false);
                     if (!autoAck)
                     {
                         if (success)
                         {
-                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken);
+                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken).ConfigureAwait(false);
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken);
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger.LogError(ex, "消息处理失败，Queue: {Queue}, DeliveryTag: {DeliveryTag}", queueName, ea.DeliveryTag);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
                     }
                 }
             };
@@ -143,12 +169,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 autoAck: autoAck,
                 consumerTag: consumerTag ?? string.Empty,
                 consumer: consumer,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 持续阻塞等待，直到取消令牌被触发
             try
             {
-                await Task.Delay(Timeout.Infinite, cancellationToken);
+                await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -203,10 +229,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 throw new ArgumentException("队列名称不能为空。", nameof(queueName));
 
             var pool = _poolManager.GetPool(configId);
-            var connection = pool.GetConnection();
-            var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+            var connection = await pool.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            await TrackChannelAsync(channel);
+            await TrackChannelAsync(channel).ConfigureAwait(false);
 
             // 声明交换机
             await channel.ExchangeDeclareAsync(
@@ -215,7 +241,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 durable: durable,
                 autoDelete: autoDelete,
                 arguments: null,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 声明队列（根据队列类型构建参数）
             var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
@@ -226,7 +252,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 exclusive: exclusive,
                 autoDelete: autoDelete,
                 arguments: queueArguments,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 绑定队列到交换机
             await channel.QueueBindAsync(
@@ -234,43 +260,57 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 exchange: exchange,
                 routingKey: routingKey ?? string.Empty,
                 arguments: null,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 设置 QoS
             await channel.BasicQosAsync(
                 prefetchSize: 0,
                 prefetchCount: prefetchCount,
                 global: false,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 创建异步事件消费者并注册 ReceivedAsync 回调
             var consumer = new AsyncEventingBasicConsumer(channel);
             consumer.ReceivedAsync += async (sender, ea) =>
             {
                 var bodyString = Encoding.UTF8.GetString(ea.Body.Span);
-                var body = DeserializeBody<T>(ea.Body.Span);
+                T body;
+                try
+                {
+                    body = _serializer.Deserialize<T>(ea.Body.Span);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "消息反序列化失败，消息将被丢弃。Queue: {Queue}", queueName);
+                    if (!autoAck)
+                    {
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    return;
+                }
                 var sourceRoutingKey = ea.RoutingKey ?? string.Empty;
 
                 try
                 {
-                    var success = await allwaysRunActionTask(body, bodyString, sourceRoutingKey);
+                    var success = await allwaysRunActionTask(body, bodyString, sourceRoutingKey).ConfigureAwait(false);
                     if (!autoAck)
                     {
                         if (success)
                         {
-                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken);
+                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken).ConfigureAwait(false);
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken);
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger.LogError(ex, "消息处理失败，Exchange: {Exchange}, Queue: {Queue}, DeliveryTag: {DeliveryTag}", exchange, queueName, ea.DeliveryTag);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
                     }
                 }
             };
@@ -281,12 +321,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 autoAck: autoAck,
                 consumerTag: consumerTag ?? string.Empty,
                 consumer: consumer,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // 持续阻塞等待，直到取消令牌被触发
             try
             {
-                await Task.Delay(Timeout.Infinite, cancellationToken);
+                await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -295,37 +335,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
-        /// 将消息体字节内容反序列化为目标类型
-        /// </summary>
-        /// <typeparam name="T">目标类型</typeparam>
-        /// <param name="body">消息体字节内容</param>
-        /// <returns>反序列化后的消息体对象</returns>
-        private static T DeserializeBody<T>(ReadOnlySpan<byte> body)
-        {
-            var targetType = typeof(T);
-
-            if (targetType == typeof(string))
-            {
-                return (T)(object)Encoding.UTF8.GetString(body);
-            }
-
-            if (targetType == typeof(byte[]))
-            {
-                return (T)(object)body.ToArray();
-            }
-
-            // JSON 反序列化
-            return JsonSerializer.Deserialize<T>(body)
-                ?? throw new JsonException($"无法将消息体反序列化为类型 {targetType.FullName}");
-        }
-
-        /// <summary>
         /// 追踪通道实例，用于资源释放时统一关闭
         /// </summary>
         /// <param name="channel">要追踪的通道实例</param>
         private async Task TrackChannelAsync(IChannel channel)
         {
-            await _semaphore.WaitAsync();
+            await _semaphore.WaitAsync().ConfigureAwait(false);
             try
             {
                 _channels.Add(channel);
@@ -346,7 +361,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
             _disposed = true;
 
-            await _semaphore.WaitAsync();
+            await _semaphore.WaitAsync().ConfigureAwait(false);
             try
             {
                 foreach (var channel in _channels)
@@ -355,9 +370,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     {
                         if (channel.IsOpen)
                         {
-                            await channel.CloseAsync();
+                            await channel.CloseAsync().ConfigureAwait(false);
                         }
-                        await channel.DisposeAsync();
+                        await channel.DisposeAsync().ConfigureAwait(false);
                     }
                     catch
                     {

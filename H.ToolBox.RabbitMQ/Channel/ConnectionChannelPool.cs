@@ -24,14 +24,19 @@ namespace H.ToolBox.RabbitMQ.Channel
         private static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(30);
 
 #if NET10_0_OR_GREATER
-        private static readonly Lock SLock = new();
+        private readonly Lock _connectionLock = new();
 #else
-        private static readonly object SLock = new();
+        private readonly object _connectionLock = new();
 #endif
 
         private readonly Func<Task<IConnection>> _connectionActivator;
         private readonly bool _isPublishConfirms;
         private readonly ILogger<ConnectionChannelPool> _logger;
+
+        /// <summary>
+        /// 是否启用了发布确认模式
+        /// </summary>
+        public bool IsPublishConfirms => _isPublishConfirms;
 
         /// <summary>
         /// 通道池，每个条目携带归还时的时间戳（Ticks），用于空闲超时判断
@@ -79,16 +84,27 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
-        /// 获取连接
+        /// 异步获取连接，如果连接不存在或已关闭则创建新连接
         /// </summary>
-        public IConnection GetConnection()
+        public async Task<IConnection> GetConnectionAsync(CancellationToken cancellationToken = default)
         {
-            lock (SLock)
+            lock (_connectionLock)
             {
                 if (_connection != null && _connection.IsOpen) return _connection;
+            }
 
-                _connection?.Dispose();
-                _connection = _connectionActivator().GetAwaiter().GetResult();
+            var connection = await _connectionActivator().ConfigureAwait(false);
+            lock (_connectionLock)
+            {
+                if (_connection == null || !_connection.IsOpen)
+                {
+                    _connection?.Dispose();
+                    _connection = connection;
+                }
+                else
+                {
+                    connection.Dispose();
+                }
                 return _connection;
             }
         }
@@ -100,7 +116,7 @@ namespace H.ToolBox.RabbitMQ.Channel
         {
             if (options.HostName.Count == 0)
             {
-                throw new ArgumentException("RabbitMQ HostName 至少配置一个节点");
+                throw new ArgumentException("HostName 列表不能为空，至少需要配置一个 RabbitMQ 节点。");
             }
 
             var clientProvidedName = string.IsNullOrWhiteSpace(options.ClientProvidedName)
@@ -162,7 +178,8 @@ namespace H.ToolBox.RabbitMQ.Channel
                             return entry.Channel;
                         }
 
-                        return await GetConnection().CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken);
+                        var conn = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+                        return await conn.CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken).ConfigureAwait(false);
                     }
                     catch
                     {
@@ -186,7 +203,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                 }
 
                 // 等待信号量（支持取消）
-                await _semaphore.WaitAsync(cancellationToken);
+                await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
                     if (_pool.TryDequeue(out var entry))
@@ -194,7 +211,8 @@ namespace H.ToolBox.RabbitMQ.Channel
                         return entry.Channel;
                     }
 
-                    return await GetConnection().CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken);
+                    var conn = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+                    return await conn.CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -209,7 +227,7 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// </summary>
         public virtual async Task<IChannel> Rent()
         {
-            return await ((IConnectionChannelPool)this).Rent();
+            return await ((IConnectionChannelPool)this).Rent().ConfigureAwait(false);
         }
 
         /// <summary>
@@ -276,6 +294,10 @@ namespace H.ToolBox.RabbitMQ.Channel
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "回收空闲通道时发生异常");
+                    }
+                    finally
+                    {
+                        _semaphore.Release();
                     }
                 }
 

@@ -1,6 +1,7 @@
 ﻿using H.ToolBox.RabbitMQ.Channel;
 using H.ToolBox.RabbitMQ.Consumer;
 using H.ToolBox.RabbitMQ.Model;
+using H.ToolBox.RabbitMQ.Serializer;
 using H.ToolBox.RabbitMQ.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -97,14 +98,18 @@ namespace H.ToolBox.RabbitMQ
             // 注册消费者服务选择器：扫描 IToolBoxRabbitMQ 实现类中的 [RabbitMQConsumer] 特性方法
             services.TryAddSingleton<IConsumerServiceSelector, ConsumerServiceSelector>();
 
+            // 注册消息序列化器（TryAdd：用户可在调用 AddRabbitMQ 前注册自定义实现以覆盖默认值）
+            services.TryAddSingleton<IMessageSerializer, SystemTextJsonMessageSerializer>();
+
             // 注册消息传输服务（生产者），用于发送消息到 RabbitMQ
-            services.AddSingleton<IRabbitMqTransport, RabbitMqTransport>();
+            // 使用 TryAddSingleton 允许用户在调用 AddRabbitMQ 前注册自定义实现以覆盖默认值
+            services.TryAddSingleton<IRabbitMqTransport, RabbitMqTransport>();
 
             // 注册消费者客户端工厂，负责创建并初始化消费者客户端实例
-            services.AddSingleton<IRabbitMqConsumerClientFactory, RabbitMqConsumerClientFactory>();
+            services.TryAddSingleton<IRabbitMqConsumerClientFactory, RabbitMqConsumerClientFactory>();
 
             // 注册消费者服务，提供简化的队列消费和路由消费 API
-            services.AddSingleton<IConsumerService, ConsumerService>();
+            services.TryAddSingleton<IConsumerService, ConsumerService>();
 
             // 注册方法匹配缓存，缓存消费者名称到扫描结果的映射，避免重复反射扫描
             services.TryAddSingleton<MethodMatcherCache>();

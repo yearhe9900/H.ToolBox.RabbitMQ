@@ -1,6 +1,7 @@
 using H.ToolBox.RabbitMQ.Model;
 using RabbitMQ.Client;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 
 namespace H.ToolBox.RabbitMQ.Channel
@@ -15,10 +16,19 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// 缓存附加到 IChannel 实例上，通道被 GC 时缓存自动回收
         /// </summary>
         private static readonly ConditionalWeakTable<IChannel, HashSet<string>> s_caches = new();
+#if NET10_0_OR_GREATER
+        private static readonly Lock s_cacheLock = new();
+#else
         private static readonly object s_cacheLock = new();
+#endif
 
         private readonly IChannel _channel;
         private readonly HashSet<string> _declared;
+#if NET10_0_OR_GREATER
+        private readonly Lock _declaredLock = new();
+#else
+        private readonly object _declaredLock = new();
+#endif
 
         public CachedDeclareChannel(IChannel channel)
         {
@@ -26,28 +36,39 @@ namespace H.ToolBox.RabbitMQ.Channel
             _declared = GetOrCreateCache(channel);
         }
 
+        /// <summary>
+        /// 获取底层的原始通道实例（用于注册事件、获取 deliveryTag 等操作）
+        /// </summary>
+        public IChannel Channel => _channel;
+
         public bool IsOpen => _channel.IsOpen;
 
         /// <summary>
         /// 声明交换机（幂等缓存，同参数只声明一次）
         /// </summary>
-        public async Task ExchangeDeclareAsync(string exchange, string type, bool durable, CancellationToken cancellationToken)
+        public async Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken)
         {
-            var key = $"e|{exchange}|{type}|{durable}";
-            if (!_declared.Add(key)) return;
+            var key = $"e|{exchange}|{type}|{durable}|{autoDelete}";
+            lock (_declaredLock)
+            {
+                if (!_declared.Add(key)) return;
+            }
 
-            await _channel.ExchangeDeclareAsync(exchange, type, durable, false, null, false, cancellationToken);
+            await _channel.ExchangeDeclareAsync(exchange, type, durable, autoDelete, null, false, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
         /// 声明队列（幂等缓存，同参数只声明一次）
         /// </summary>
-        public async Task QueueDeclareAsync(string queue, bool durable, QueueType queueType, IDictionary<string, object?>? arguments, CancellationToken cancellationToken)
+        public async Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, QueueType queueType, IDictionary<string, object?>? arguments, CancellationToken cancellationToken)
         {
-            var key = $"q|{queue}|{durable}|{queueType}";
-            if (!_declared.Add(key)) return;
+            var key = $"q|{queue}|{durable}|{exclusive}|{autoDelete}|{queueType}|{FormatArguments(arguments)}";
+            lock (_declaredLock)
+            {
+                if (!_declared.Add(key)) return;
+            }
 
-            await _channel.QueueDeclareAsync(queue, durable, false, false, arguments, false, cancellationToken);
+            await _channel.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, false, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -81,6 +102,14 @@ namespace H.ToolBox.RabbitMQ.Channel
                 s_caches.Add(channel, cache);
                 return cache;
             }
+        }
+
+        private static string FormatArguments(IDictionary<string, object?>? arguments)
+        {
+            if (arguments == null || arguments.Count == 0)
+                return string.Empty;
+
+            return string.Join(",", arguments.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}"));
         }
     }
 }

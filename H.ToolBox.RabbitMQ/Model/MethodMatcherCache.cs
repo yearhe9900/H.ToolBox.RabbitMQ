@@ -61,11 +61,16 @@ namespace H.ToolBox.RabbitMQ.Model
                 var name = methodScanResult.ConsumerAttribute.ConsumerName;
                 if (string.IsNullOrEmpty(name))
                 {
-                    continue;
+                    // 自动生成稳定的消费者名称：类名.方法名
+                    var declaringType = methodScanResult.MethodInfo.DeclaringType;
+                    name = declaringType != null
+                        ? $"{declaringType.Name}.{methodScanResult.MethodInfo.Name}"
+                        : methodScanResult.MethodInfo.Name;
+                    methodScanResult.ConsumerAttribute.ConsumerName = name;
                 }
 
-                // 尝试将扫描结果添加到缓存
-                Entries.TryAdd(name, methodScanResult);
+                // 使用索引器确保重启时更新已有条目（TryAdd 不会覆盖旧值）
+                Entries[name] = methodScanResult;
             }
             return Entries;
         }

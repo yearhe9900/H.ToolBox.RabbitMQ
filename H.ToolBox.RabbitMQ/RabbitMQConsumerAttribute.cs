@@ -31,9 +31,9 @@ namespace H.ToolBox.RabbitMQ
 
         /// <summary>
         /// 获取或设置消费者名称，用于标识和日志记录
-        /// 默认值为随机生成的 GUID 字符串
+        /// 默认值为 null，启动时自动生成为 "类名.方法名" 格式的稳定名称
         /// </summary>
-        public string? ConsumerName { get; set; } = Guid.NewGuid().ToString();
+        public string? ConsumerName { get; set; }
 
         /// <summary>
         /// 获取或设置交换机名称，用于交换机模式的消息路由
@@ -105,5 +105,17 @@ namespace H.ToolBox.RabbitMQ
         /// 设置为 0 表示使用 <see cref="RabbitMQOptions.QuorumGroupSize"/> 或 RabbitMQ 服务器默认值
         /// </summary>
         public int QuorumGroupSize { get; set; }
+
+        /// <summary>
+        /// 获取或设置队列是否为独占队列，默认为 false
+        /// 独占队列仅允许当前连接访问，连接断开后自动删除
+        /// </summary>
+        public bool Exclusive { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置队列是否自动删除，默认为 false
+        /// 当最后一个消费者断开连接后，队列将自动删除
+        /// </summary>
+        public bool AutoDelete { get; set; } = false;
     }
 }

@@ -182,7 +182,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
             _selector = _serviceProvider.GetRequiredService<MethodMatcherCache>();
 
             // 执行消费者注册逻辑
-            await ExecuteAsync();
+            await ExecuteAsync().ConfigureAwait(false);
         }
 
         /// <summary>
@@ -210,7 +210,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 }
 
                 // 重新执行消费者注册
-                await ExecuteAsync();
+                await ExecuteAsync().ConfigureAwait(false);
             }
         }
 
@@ -249,12 +249,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
             // 通过缓存获取所有消费者方法扫描结果
             var methodScanResults = _selector.TrySetExecutor();
-            if (methodScanResults.IsEmpty)
+
+            // 重置健康计数器，为本次启动做准备
+            lock (_healthLock)
             {
-                lock (_healthLock)
-                {
-                    _zeroConsumers = true;
-                }
+                _totalConsumers = 0;
+                _healthyConsumers = 0;
+                _zeroConsumers = methodScanResults.IsEmpty;
             }
 
             foreach (var methodScanResult in methodScanResults)
@@ -281,13 +282,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
                         }
 
                         // 在独立的 Task 中启动每个消费者实例，避免阻塞注册流程
-                        _ = Task.Factory.StartNew(async () =>
+                        _ = Task.Run(async () =>
                         {
                             try
                             {
                                 // 使用 using 确保客户端在任务结束时被正确释放
                                 // 通过消费者的 ConfigId 创建对应集群的客户端
-                                await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId);
+                                await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId).ConfigureAwait(false);
 
                                 // 注册消息处理和日志回调
                                 RegisterMessageProcessor(client);
@@ -308,10 +309,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                         AutoAck = attr.AutoAck,
                                         ConsumerConcurrent = attr.ConsumerConcurrent,
                                         QueueType = attr.QueueType,
+                                        Exclusive = attr.Exclusive,
+                                        AutoDelete = attr.AutoDelete,
                                         QuorumGroupSize = attr.QuorumGroupSize > 0
                                             ? attr.QuorumGroupSize
                                             : _poolManager.GetOptions(consumerConfigId).QuorumGroupSize,
-                                    });
+                                    }).ConfigureAwait(false);
                             }
                             catch (OperationCanceledException)
                             {
@@ -319,10 +322,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
                             }
                             catch (Exception ex)
                             {
-                                // 消费者任务异常（如连接断开），标记为不健康
+                                // 消费者任务异常（如连接断开），同步递减两个计数器使比率可自愈
                                 lock (_healthLock)
                                 {
                                     _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
+                                    _totalConsumers = Math.Max(0, _totalConsumers - 1);
                                 }
                                 _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})", attr.ConsumerName, consumerConfigId);
                             }
@@ -416,11 +420,26 @@ namespace H.ToolBox.RabbitMQ.Consumer
                         var methodInfo = executor.MethodInfo;
                         try
                         {
+                            // 校验方法签名：要求 (string, string) 或 (string, string, CancellationToken)
+                            var parameters = methodInfo!.GetParameters();
+                            if (parameters.Length < 2
+                                || parameters[0].ParameterType != typeof(string)
+                                || parameters[1].ParameterType != typeof(string))
+                            {
+                                _logger.LogError("消费者方法 {Method} 签名不符合要求，需要 (string, string) 参数", methodInfo.Name);
+                                await client.CommitAsync(sender).ConfigureAwait(false);
+                                return;
+                            }
+
                             // 构造方法参数：[消息内容, 路由键]
 #if NET10_0_OR_GREATER
-                            object?[] invokeParams = [message.BodyContent, message.RoutingKey];
+                            object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
+                                ? [message.BodyContent, message.RoutingKey, CancellationToken.None]
+                                : [message.BodyContent, message.RoutingKey];
 #else
-                            object?[] invokeParams = new object?[] { message.BodyContent, message.RoutingKey };
+                            object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
+                                ? new object?[] { message.BodyContent, message.RoutingKey, CancellationToken.None }
+                                : new object?[] { message.BodyContent, message.RoutingKey };
 #endif
                             // 通过反射调用目标消费者方法
                             var result = methodInfo!.Invoke(instance, invokeParams);
@@ -429,11 +448,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
                             // 根据返回类型处理结果，用于决定消息确认或拒绝
                             if (result is Task<bool> boolTask)
                             {
-                                canCommit = await boolTask;
+                                canCommit = await boolTask.ConfigureAwait(false);
                             }
                             else if (result is Task taskResult)
                             {
-                                await taskResult;
+                                await taskResult.ConfigureAwait(false);
                             }
                             else if (result is bool boolResult)
                             {
@@ -443,30 +462,30 @@ namespace H.ToolBox.RabbitMQ.Consumer
                             // 根据处理结果决定确认或拒绝消息
                             if (canCommit)
                             {
-                                await client.CommitAsync(sender);
+                                await client.CommitAsync(sender).ConfigureAwait(false);
                             }
                             else
                             {
-                                await client.RejectAsync(sender);
+                                await client.RejectAsync(sender).ConfigureAwait(false);
                             }
                         }
                         catch (Exception ex)
                         {
                             _logger.LogError(ex, "处理消息时发生异常");
-                            await client.RejectAsync(sender);
+                            await client.RejectAsync(sender).ConfigureAwait(false);
                         }
                     }
                     else
                     {
                         _logger.LogError("未找到消费者方法执行器，无法处理消息。 --> {ConsumerTag}", consumerTag);
-                        await client.RejectAsync(sender);
+                        await client.RejectAsync(sender).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
                 {
                     // 消息处理失败，记录错误并拒绝消息（消息将被重新入队）
                     _logger.LogError(ex, "处理消息时发生异常");
-                    await client.RejectAsync(sender);
+                    await client.RejectAsync(sender).ConfigureAwait(false);
                 }
             };
         }

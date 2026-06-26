@@ -9,10 +9,16 @@ namespace H.ToolBox.RabbitMQ.Channel
     public interface IConnectionChannelPool
     {
         /// <summary>
-        /// 获取RabbitMQ连接实例
+        /// 是否启用了发布确认模式
         /// </summary>
+        bool IsPublishConfirms { get; }
+
+        /// <summary>
+        /// 异步获取RabbitMQ连接实例
+        /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
         /// <returns>RabbitMQ连接对象</returns>
-        IConnection GetConnection();
+        Task<IConnection> GetConnectionAsync(CancellationToken cancellationToken = default);
 
         /// <summary>
         /// 从通道池中租借一个可用的RabbitMQ通道

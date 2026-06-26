@@ -16,19 +16,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
     ///   <item><description>接收 RabbitMQ 服务器推送的消息</description></item>
     ///   <item><description>将消息体解码并封装为 <see cref="TransportMessage"/> 对象</description></item>
     ///   <item><description>通过回调委托将消息传递给上层业务逻辑处理</description></item>
-    ///   <item><description>支持并发控制（通过信号量限制并行处理的消息数量）</description></item>
+    ///   <item><description>支持并发控制（通过 Task.Run 实现并发处理，并发度由 BasicQos(prefetchCount) 控制）</description></item>
     ///   <item><description>提供手动确认（Ack）和拒绝（Reject）机制</description></item>
     ///   <item><description>监听消费者生命周期事件（注册、取消、关闭等）并通知日志回调</description></item>
     /// </list>
     /// </remarks>
     public class RabbitMqBasicConsumer : AsyncDefaultBasicConsumer
     {
-        /// <summary>
-        /// 信号量，用于控制消息处理的并发度
-        /// 当 concurrent 参数大于 0 时，使用信号量限制并行处理的消息数量
-        /// </summary>
-        private readonly SemaphoreSlim _semaphore;
-
         /// <summary>
         /// 消息接收回调委托
         /// 当消费者收到消息时被调用，参数分别为：消息对象、投递标签、消费者标签
@@ -43,7 +37,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
         /// <summary>
         /// 标识是否使用 Task.Run 进行并发消息处理
-        /// 当 concurrent > 0 时为 true，消息将在独立的线程池线程中处理
+        /// 当 concurrent > 0 时为 true，消息将在独立的线程池线程中处理，
+        /// 实际并发度由 BasicQos(prefetchCount) 控制
         /// </summary>
         private readonly bool _usingTaskRun;
 
@@ -58,8 +53,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// </summary>
         /// <param name="channel">RabbitMQ 通道，用于与服务器通信</param>
         /// <param name="concurrent">
-        /// 并发级别。为 0 时消息顺序处理；大于 0 时使用信号量控制并发数量，
-        /// 消息将在独立的 Task 中并行处理
+        /// 并发模式。为 0 时消息顺序处理；大于 0 时消息在独立的 Task 中并行处理，
+        /// 实际并发度由 BasicQos(prefetchCount) 控制
         /// </param>
         /// <param name="msgCallback">消息接收回调，收到消息时被调用</param>
         /// <param name="logCallback">日志回调，消费者状态变化时被调用</param>
@@ -70,7 +65,6 @@ namespace H.ToolBox.RabbitMQ.Consumer
             Action<LogMessageEventArgs> logCallback, bool isAutoAck = false
             ) : base(channel)
         {
-            _semaphore = new SemaphoreSlim(concurrent);
             _usingTaskRun = concurrent > 0;
             _msgCallback = msgCallback;
             _logCallback = logCallback;
@@ -93,41 +87,33 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <remarks>
         /// 处理模式：
         /// <list type="bullet">
-        ///   <item><description>当 <see cref="_usingTaskRun"/> 为 true 时：使用信号量控制并发，
-        ///     消息在 Task.Run 中异步处理，body 会被复制到安全副本以避免缓冲区回收问题</description></item>
+        ///   <item><description>当 <see cref="_usingTaskRun"/> 为 true 时：
+        ///     消息在 Task.Run 中异步处理，body 会被复制到安全副本以避免缓冲区回收问题，
+        ///     实际并发度由 BasicQos(prefetchCount) 控制</description></item>
         ///   <item><description>当 <see cref="_usingTaskRun"/> 为 false 时：直接在当前上下文中顺序处理消息</description></item>
         /// </list>
         /// </remarks>
-        public override async Task HandleBasicDeliverAsync(string consumerTag, ulong deliveryTag, bool redelivered, string exchange,
+        public override Task HandleBasicDeliverAsync(string consumerTag, ulong deliveryTag, bool redelivered, string exchange,
             string routingKey, IReadOnlyBasicProperties properties, ReadOnlyMemory<byte> body,
             CancellationToken cancellationToken = default)
         {
             if (_usingTaskRun)
             {
-                // 获取信号量，控制并发处理的消息数量
-                await _semaphore.WaitAsync(cancellationToken);
-
                 // 复制消息体到安全副本，防止原始缓冲区被回收后数据丢失
                 ReadOnlyMemory<byte> safeBody = body.ToArray();
 
                 // 在独立的 Task 中异步处理消息，不阻塞消息接收循环
-                _ = Task.Run(async () =>
+                // 实际并发度由 BasicQos(prefetchCount) 控制
+                // 不传 cancellationToken 给 Task.Run，避免通道取消时 Task 未执行即丢弃消息
+                return Task.Run(async () =>
                 {
-                    try
-                    {
-                        await Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, safeBody);
-                    }
-                    finally
-                    {
-                        // 处理完成后释放信号量，允许下一条消息被处理
-                        _semaphore.Release();
-                    }
-                }, cancellationToken).ConfigureAwait(false);
+                    await Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, safeBody);
+                });
             }
             else
             {
                 // 顺序处理模式：直接在当前上下文中消费消息
-                await Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, body).ConfigureAwait(false);
+                return Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, body);
             }
         }
 
@@ -165,7 +151,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步操作的任务</returns>
         public override async Task HandleBasicConsumeOkAsync(string consumerTag, CancellationToken cancellationToken = default)
         {
-            await base.HandleBasicConsumeOkAsync(consumerTag, cancellationToken);
+            await base.HandleBasicConsumeOkAsync(consumerTag, cancellationToken).ConfigureAwait(false);
 
             var args = new LogMessageEventArgs
             {
@@ -185,7 +171,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步操作的任务</returns>
         protected override async Task OnCancelAsync(string[] consumerTags, CancellationToken cancellationToken = default)
         {
-            await base.OnCancelAsync(consumerTags, cancellationToken);
+            await base.OnCancelAsync(consumerTags, cancellationToken).ConfigureAwait(false);
 
             var args = new LogMessageEventArgs
             {
@@ -205,7 +191,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步操作的任务</returns>
         public override async Task HandleBasicCancelOkAsync(string consumerTag, CancellationToken cancellationToken = default)
         {
-            await base.HandleBasicCancelOkAsync(consumerTag, cancellationToken);
+            await base.HandleBasicCancelOkAsync(consumerTag, cancellationToken).ConfigureAwait(false);
 
             var args = new LogMessageEventArgs
             {
@@ -225,7 +211,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步操作的任务</returns>
         public override async Task HandleChannelShutdownAsync(object channel, ShutdownEventArgs reason)
         {
-            await base.HandleChannelShutdownAsync(channel, reason);
+            await base.HandleChannelShutdownAsync(channel, reason).ConfigureAwait(false);
 
             var args = new LogMessageEventArgs
             {
@@ -246,30 +232,20 @@ namespace H.ToolBox.RabbitMQ.Consumer
         public async Task BasicAck(ulong deliveryTag)
         {
             if (Channel.IsOpen && !_isAutoAck)
-                await Channel.BasicAckAsync(deliveryTag, false);
-
-            // 释放信号量，允许下一条消息被处理
-            _semaphore.Release();
+                await Channel.BasicAckAsync(deliveryTag, false).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// 拒绝消息，消息将被重新入队等待重新消费
+        /// 拒绝消息
         /// 仅在手动确认模式（非 AutoAck）下生效
         /// </summary>
         /// <param name="deliveryTag">消息投递标签</param>
+        /// <param name="requeue">是否重新入队。为 false 时消息将进入死信队列（需配置 DLX），避免毒消息无限循环</param>
         /// <returns>表示异步拒绝操作的任务</returns>
-        /// <remarks>
-        /// 拒绝后消息会被重新入队（requeue=true），可能会被同一个或不同的消费者重新消费。
-        /// 如果消息持续被拒绝，可能导致消息在队列中无限循环。
-        /// 建议配合死信队列（DLQ）使用，将多次拒绝的消息路由到死信队列进行人工处理。
-        /// </remarks>
-        public async Task BasicReject(ulong deliveryTag)
+        public async Task BasicReject(ulong deliveryTag, bool requeue = false)
         {
             if (Channel.IsOpen && !_isAutoAck)
-                await Channel.BasicRejectAsync(deliveryTag, true);
-
-            // 释放信号量，允许下一条消息被处理
-            _semaphore.Release();
+                await Channel.BasicRejectAsync(deliveryTag, requeue).ConfigureAwait(false);
         }
     }
 }

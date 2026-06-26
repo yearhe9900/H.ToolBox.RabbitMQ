@@ -63,6 +63,28 @@ namespace H.ToolBox.RabbitMQ.Transport
         public int? QuorumGroupSize { get; set; }
 
         /// <summary>
+        /// 获取或设置队列是否为独占队列，默认为 false
+        /// </summary>
+        public bool Exclusive { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置队列/交换机是否自动删除，默认为 false
+        /// </summary>
+        public bool AutoDelete { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置消息无法路由时是否返回给发布者，默认为 false。
+        /// 设置为 true 时，如果没有队列绑定匹配 routingKey，Broker 会将消息退回发布者。
+        /// </summary>
+        public bool Mandatory { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置发布失败时的最大重试次数，默认为 null（不重试）。
+        /// 设置为 0 也表示不重试。重试采用指数退避策略。
+        /// </summary>
+        public int? MaxRetries { get; set; } = null;
+
+        /// <summary>
         /// 获取消息体的原始字节内容
         /// </summary>
         public ReadOnlyMemory<byte> Body { get; }

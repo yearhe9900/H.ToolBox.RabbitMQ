@@ -76,7 +76,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步确认操作的任务</returns>
         public async Task CommitAsync(object? sender)
         {
-            await _consumer!.BasicAck((ulong)sender!);
+            await _consumer!.BasicAck((ulong)sender!).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -87,7 +87,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步拒绝操作的任务</returns>
         public async Task RejectAsync(object? sender)
         {
-            await _consumer!.BasicReject((ulong)sender!);
+            await _consumer!.BasicReject((ulong)sender!).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -119,7 +119,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
             }
 
             // 建立连接并创建通道
-            await ConnectAsync();
+            await ConnectAsync().ConfigureAwait(false);
 
             // 确定预取消息数量，最小值为 1
             ushort prefetch = options.PrefetchCount > 0 ? options.PrefetchCount : (ushort)1;
@@ -135,12 +135,22 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
             if (isExchangeMode)
             {
-                // Exchange 模式：声明交换机，队列绑定由外部配置完成
+                // Exchange 模式：声明交换机、声明队列、绑定队列到交换机
                 var exchange = options.Exchange ?? string.Empty;
                 var exchangeType = options.ExchangeType ?? "direct";
                 var routingKey = options.RoutingKey!;
 
-                await _channel!.ExchangeDeclareAsync(exchange, exchangeType, options.Durable, false, null);
+                await _channel!.ExchangeDeclareAsync(exchange, exchangeType, options.Durable, options.AutoDelete, null).ConfigureAwait(false);
+
+                var queueDeclareOk = await _channel!.QueueDeclareAsync(
+                    options.QueueName ?? string.Empty,
+                    options.Durable,
+                    options.Exclusive,
+                    options.AutoDelete,
+                    queueArguments).ConfigureAwait(false);
+                queueName = queueDeclareOk.QueueName;
+
+                await _channel!.QueueBindAsync(queueName, exchange, routingKey, arguments: null).ConfigureAwait(false);
             }
             else
             {
@@ -149,26 +159,26 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 var queueDeclareOk = await _channel!.QueueDeclareAsync(
                     options.QueueName ?? string.Empty,
                     options.Durable,
-                    false,
-                    false,
-                    queueArguments);
+                    options.Exclusive,
+                    options.AutoDelete,
+                    queueArguments).ConfigureAwait(false);
                 queueName = queueDeclareOk.QueueName;
             }
 
             // 设置 QoS：控制消费者在未确认消息的情况下最多接收的消息数量
-            await _channel!.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetch, global: false, cancellationToken);
+            await _channel!.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetch, global: false, cancellationToken).ConfigureAwait(false);
 
             // 创建异步基础消费者，传入消息回调和日志回调
             _consumer = new RabbitMqBasicConsumer(_channel, consumerConcurrent, OnMessageCallback!, OnLogCallback!, options.AutoAck);
 
             // 注册消费者并开始消费消息
-            await _channel!.BasicConsumeAsync(queueName, options.AutoAck, options.ConsumerName ?? string.Empty, _consumer, cancellationToken);
+            await _channel!.BasicConsumeAsync(queueName, options.AutoAck, options.ConsumerName ?? string.Empty, _consumer, cancellationToken).ConfigureAwait(false);
 
             // 持续阻塞等待，直到取消令牌被触发
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                cancellationToken.WaitHandle.WaitOne(timeout);
+                await Task.Delay(timeout, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -180,11 +190,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步连接操作的任务</returns>
         public async Task ConnectAsync()
         {
-            // 从连接池中获取一个可用的 RabbitMQ 连接
-            var connection = _connectionChannelPool.GetConnection();
-
             // 等待获取信号量，确保同一时间只有一个线程可以执行通道创建逻辑
-            await _semaphore.WaitAsync();
+            await _semaphore.WaitAsync().ConfigureAwait(false);
 
             try
             {
@@ -193,8 +200,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 2. 通道已关闭（需要重建）
                 if (_channel == null || _channel.IsClosed)
                 {
+                    // 从连接池中异步获取一个可用的 RabbitMQ 连接
+                    var connection = await _connectionChannelPool.GetConnectionAsync().ConfigureAwait(false);
                     // 通过连接创建新的通道
-                    _channel = await connection.CreateChannelAsync();
+                    _channel = await connection.CreateChannelAsync().ConfigureAwait(false);
                 }
             }
             finally
@@ -210,9 +219,16 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>值任务</returns>
         public async ValueTask DisposeAsync()
         {
-            if (_channel != null)
+            try
             {
-                await _channel.DisposeAsync();
+                if (_channel != null)
+                {
+                    await _channel.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                // 通道释放失败不应阻止信号量清理
             }
             _semaphore.Dispose();
         }

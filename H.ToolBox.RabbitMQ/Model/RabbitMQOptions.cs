@@ -94,6 +94,12 @@ namespace H.ToolBox.RabbitMQ.Model
         public int? QuorumGroupSize { get; set; }
 
         /// <summary>
+        /// 发布确认超时时间，超过此时间仍未收到 Broker 确认的消息将被视为失败，默认30秒。
+        /// 仅当 <see cref="PublishConfirms"/> 为 true 时生效。
+        /// </summary>
+        public TimeSpan PublishConfirmsTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+        /// <summary>
         /// 连接工厂自定义配置回调
         /// 允许对 <see cref="ConnectionFactory"/> 进行额外的个性化设置（如SSL、超时时间等）
         /// </summary>

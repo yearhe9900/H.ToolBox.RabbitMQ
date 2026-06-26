@@ -101,7 +101,6 @@ namespace H.ToolBox.RabbitMQ
                     _logger.LogError(ex, "启动RabbitMQ消费者时发生错误。");
                 }
             }
-             _disposed = false;
             _logger.LogInformation("RabbitMQ启动器已成功启动");
         }
 
@@ -121,11 +120,13 @@ namespace H.ToolBox.RabbitMQ
         public override void Dispose()
         {
             if (_disposed) return;
-
-            _cts?.Cancel();
-            _cts?.Dispose();
-            _cts = null;
             _disposed = true;
+
+            try { _cts?.Cancel(); } catch (ObjectDisposedException) { }
+            try { _cts?.Dispose(); } catch (ObjectDisposedException) { }
+            _cts = null;
+
+            base.Dispose();
         }
 
         /// <summary>

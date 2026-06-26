@@ -48,8 +48,10 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 交换机类型，默认为 Topic（主题交换机）。
         /// 可选值参见 <see cref="ExchangeTypeConst"/>：Direct、Fanout、Headers、Topic
         /// </param>
+        /// <param name="mandatory">消息无法路由时是否返回给发布者，默认为 false</param>
+        /// <param name="maxRetries">发布失败时的最大重试次数，默认为 null（不重试）</param>
         /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
-        Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, CancellationToken cancellationToken = default) where T : class;
+        Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, bool mandatory = false, int? maxRetries = null, CancellationToken cancellationToken = default) where T : class;
     }
 }

@@ -80,5 +80,17 @@ namespace H.ToolBox.RabbitMQ.Model
         /// null 表示使用全局配置或服务器默认值
         /// </summary>
         public int? QuorumGroupSize { get; set; }
+
+        /// <summary>
+        /// 获取或设置队列是否为独占队列，默认为 false
+        /// 独占队列仅允许当前连接访问，连接断开后自动删除
+        /// </summary>
+        public bool Exclusive { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置队列是否自动删除，默认为 false
+        /// 当最后一个消费者断开连接后，队列将自动删除
+        /// </summary>
+        public bool AutoDelete { get; set; } = false;
     }
 }

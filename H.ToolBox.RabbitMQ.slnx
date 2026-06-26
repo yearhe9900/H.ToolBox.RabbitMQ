@@ -1,7 +1,4 @@
 <Solution>
-  <Folder Name="/test/">
-    <Project Path="H.ToolBox.RabbitMQ.Application/H.ToolBox.RabbitMQ.Application.csproj" Id="d9ba07bc-1924-4ce3-9582-509ae88a722a" />
-    <Project Path="H.ToolBox.RabbitMQ.WorkerService/H.ToolBox.RabbitMQ.WorkerService.csproj" Id="ac668c85-8f28-4335-896d-e94c2f281ef3" />
-  </Folder>
+  <Project Path="H.ToolBox.RabbitMQ.Tests/H.ToolBox.RabbitMQ.Tests.csproj" />
   <Project Path="H.ToolBox.RabbitMQ/H.ToolBox.RabbitMQ.csproj" />
 </Solution>

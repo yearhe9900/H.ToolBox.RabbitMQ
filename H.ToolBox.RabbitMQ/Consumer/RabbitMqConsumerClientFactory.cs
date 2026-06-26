@@ -25,7 +25,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>已连接并准备就绪的消费者客户端</returns>
         public async Task<IRabbitMqConsumerClient> CreateAsync()
         {
-            return await CreateAsync("default");
+            return await CreateAsync("default").ConfigureAwait(false);
         }
 
         /// <summary>
@@ -37,7 +37,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         {
             var pool = _poolManager.GetPool(configId);
             var client = new RabbitMqConsumerClient(pool);
-            await client.ConnectAsync();
+            await client.ConnectAsync().ConfigureAwait(false);
             return client;
         }
     }

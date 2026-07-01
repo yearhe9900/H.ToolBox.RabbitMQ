@@ -101,18 +101,36 @@ namespace H.ToolBox.RabbitMQ
 
                 try
                 {
+                    // 先检查健康状态，避免不必要的重启
                     if (!processor.IsHealthy())
                     {
                         _logger.LogWarning("检测到消费者注册器不健康，正在尝试重启...");
 
-                        await processor.ReStartAsync(force: true).ConfigureAwait(false);
+                        // 使用 Task.Run 将重启操作放到后台线程执行，避免阻塞健康检查
+                        // 这样即使重启过程中出现问题，也不会影响推送操作
+                        await Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await processor.ReStartAsync(force: true).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                // 重启过程中被取消，忽略
+                            }
+                        }, cancellationToken).ConfigureAwait(false);
 
                         _logger.LogInformation("消费者注册器重启成功");
                     }
                     else
                     {
-                        _logger.LogDebug("消费者注册器健康检查通过");
+                        _logger.LogInformation("检测到消费者注册器健康");
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    // 服务正在停止，健康检查被取消，直接跳出循环
+                    break;
                 }
                 catch (Exception ex)
                 {

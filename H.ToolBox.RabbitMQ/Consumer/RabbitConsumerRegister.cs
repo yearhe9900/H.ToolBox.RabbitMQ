@@ -56,6 +56,16 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private CancellationTokenSource? _cts = new();
 
         /// <summary>
+        /// 外部停止令牌，用于在 ReStartAsync 中创建链接的取消令牌源
+        /// </summary>
+        private CancellationToken _externalStoppingToken;
+
+        /// <summary>
+        /// 当前批次的消费者任务集合，用于在停止时等待所有消费者退出
+        /// </summary>
+        private readonly List<Task> _consumerTasks = new();
+
+        /// <summary>
         /// 健康状态锁，保护消费者计数器的线程安全
         /// </summary>
         private readonly object _healthLock = new();
@@ -86,6 +96,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private bool _zeroConsumers;
 
         /// <summary>
+        /// 标识消费者是否正在启动中，用于避免在启动过程中触发不必要的重启
+        /// </summary>
+        private volatile bool _isStarting;
+
+        /// <summary>
         /// 初始化消费者注册器实例
         /// </summary>
         /// <param name="logger">日志记录器</param>
@@ -105,8 +120,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
-        /// 停止所有消费者并重置健康状态，但不释放 CTS 资源
-        /// 此方法可安全地从 CTS 取消回调中调用（不会产生重入问题）
+        /// 停止所有消费者并重置健康状态，等待消费者任务退出后清理任务列表。
+        /// 此方法可安全地从 CTS 取消回调中调用（使用 Task.Run 避免重入死锁）
         /// </summary>
         private void StopConsumers()
         {
@@ -118,6 +133,26 @@ namespace H.ToolBox.RabbitMQ.Consumer
             }
             // 在锁外调用 Cancel，避免回调重入时死锁
             cts.Cancel();
+
+            // 等待当前批次的消费者任务退出，避免停止后消费者任务仍在运行
+            Task[] tasks;
+            lock (_consumerTasks)
+            {
+                tasks = _consumerTasks.ToArray();
+                _consumerTasks.Clear();
+            }
+
+            if (tasks.Length > 0)
+            {
+                try
+                {
+                    Task.WaitAll(tasks, TimeSpan.FromSeconds(5));
+                }
+                catch (AggregateException)
+                {
+                    // 消费者任务因取消而抛出 OperationCanceledException，属于预期行为
+                }
+            }
         }
 
         /// <summary>
@@ -154,6 +189,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         {
             lock (_healthLock)
             {
+                // 如果消费者正在启动中，认为是健康的，避免在启动过程中触发不必要的重启
+                if (_isStarting) return true;
 
                 return _zeroConsumers ? true : _totalConsumers > 0 && _healthyConsumers == _totalConsumers;
             }
@@ -167,6 +204,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步启动操作的任务</returns>
         public async ValueTask StartAsync(CancellationToken stoppingToken)
         {
+            _externalStoppingToken = stoppingToken;
+
             lock (_ctsLock)
             {
                 // 创建关联的取消令牌源，当外部停止令牌触发时自动取消
@@ -203,10 +242,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 先停止现有消费者
                 Pulse();
 
-                // 创建新的取消令牌源
+                // 创建新的取消令牌源，链接到外部停止令牌以确保主机关闭时能传播取消信号
                 lock (_ctsLock)
                 {
-                    _cts = new CancellationTokenSource();
+                    _cts = CancellationTokenSource.CreateLinkedTokenSource(_externalStoppingToken);
                 }
 
                 // 重新执行消费者注册
@@ -247,98 +286,114 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 cts = _cts;
             }
 
-            // 通过缓存获取所有消费者方法扫描结果
-            var methodScanResults = _selector.TrySetExecutor();
+            // 标记消费者正在启动中
+            _isStarting = true;
 
-            // 重置健康计数器，为本次启动做准备
-            lock (_healthLock)
+            try
             {
-                _totalConsumers = 0;
-                _healthyConsumers = 0;
-                _zeroConsumers = methodScanResults.IsEmpty;
-            }
+                // 通过缓存获取所有消费者方法扫描结果
+                var methodScanResults = _selector.TrySetExecutor();
 
-            foreach (var methodScanResult in methodScanResults)
-            {
-                var attr = methodScanResult.Value.ConsumerAttribute;
-
-                if (attr == null)
-                    continue;
-
-                // 获取此消费者绑定的集群 ConfigId
-                var configId = attr.ConfigId ?? "default";
-                try
+                // 重置健康计数器，为本次启动做准备
+                lock (_healthLock)
                 {
-                   
-                    // 根据 ListenerCount 创建指定数量的并发消费者实例
-                    for (var i = 0; i < attr.ListenerCount; i++)
+                    _totalConsumers = 0;
+                    _healthyConsumers = 0;
+                    _zeroConsumers = methodScanResults.IsEmpty;
+                }
+
+                foreach (var methodScanResult in methodScanResults)
+                {
+                    var attr = methodScanResult.Value.ConsumerAttribute;
+
+                    if (attr == null)
+                        continue;
+
+                    // 获取此消费者绑定的集群 ConfigId
+                    var configId = attr.ConfigId ?? "default";
+                    try
                     {
-                        // 捕获当前 configId 用于闭包
-                        var consumerConfigId = configId;
 
-                        lock (_healthLock)
+                        // 根据 ListenerCount 创建指定数量的并发消费者实例
+                        for (var i = 0; i < attr.ListenerCount; i++)
                         {
-                            _totalConsumers++;
-                        }
+                            // 捕获当前 configId 用于闭包
+                            var consumerConfigId = configId;
 
-                        // 在独立的 Task 中启动每个消费者实例，避免阻塞注册流程
-                        _ = Task.Run(async () =>
-                        {
-                            try
+                            lock (_healthLock)
                             {
-                                // 使用 using 确保客户端在任务结束时被正确释放
-                                // 通过消费者的 ConfigId 创建对应集群的客户端
-                                await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId).ConfigureAwait(false);
-
-                                // 注册消息处理和日志回调
-                                RegisterMessageProcessor(client);
-
-                                // 启动消息监听，此方法会阻塞直到取消令牌被触发
-                                await client.ListeningAsync(
-                                    TimeSpan.FromSeconds(attr.WaitOneTimeOut),
-                                    cts.Token,
-                                    new ListeningOptions()
-                                    {
-                                        ConsumerName = attr.ConsumerName,
-                                        Durable = attr.Durable,
-                                        Exchange = attr.Exchange,
-                                        ExchangeType = attr.ExchangeType,
-                                        PrefetchCount = attr.PrefetchCount,
-                                        QueueName = attr.QueueName,
-                                        RoutingKey = attr.RoutingKey,
-                                        AutoAck = attr.AutoAck,
-                                        ConsumerConcurrent = attr.ConsumerConcurrent,
-                                        QueueType = attr.QueueType,
-                                        Exclusive = attr.Exclusive,
-                                        AutoDelete = attr.AutoDelete,
-                                        QuorumGroupSize = attr.QuorumGroupSize > 0
-                                            ? attr.QuorumGroupSize
-                                            : _poolManager.GetOptions(consumerConfigId).QuorumGroupSize,
-                                    }).ConfigureAwait(false);
+                                _totalConsumers++;
                             }
-                            catch (OperationCanceledException)
+
+                            // 在独立的 Task 中启动每个消费者实例，避免阻塞注册流程
+                            var task = Task.Run(async () =>
                             {
-                                // 正常取消，不需要标记为不健康
-                            }
-                            catch (Exception ex)
-                            {
-                                // 消费者任务异常（如连接断开），同步递减两个计数器使比率可自愈
-                                lock (_healthLock)
+                                try
                                 {
-                                    _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
-                                    _totalConsumers = Math.Max(0, _totalConsumers - 1);
+                                    // 使用 using 确保客户端在任务结束时被正确释放
+                                    // 通过消费者的 ConfigId 创建对应集群的客户端
+                                    await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId).ConfigureAwait(false);
+
+                                    // 注册消息处理和日志回调
+                                    RegisterMessageProcessor(client);
+
+                                    // 启动消息监听，此方法会阻塞直到取消令牌被触发
+                                    await client.ListeningAsync(
+                                        TimeSpan.FromSeconds(attr.WaitOneTimeOut),
+                                        cts.Token,
+                                        new ListeningOptions()
+                                        {
+                                            ConsumerName = attr.ConsumerName,
+                                            Durable = attr.Durable,
+                                            Exchange = attr.Exchange,
+                                            ExchangeType = attr.ExchangeType,
+                                            PrefetchCount = attr.PrefetchCount,
+                                            QueueName = attr.QueueName,
+                                            RoutingKey = attr.RoutingKey,
+                                            AutoAck = attr.AutoAck,
+                                            ConsumerConcurrent = attr.ConsumerConcurrent,
+                                            QueueType = attr.QueueType,
+                                            Exclusive = attr.Exclusive,
+                                            AutoDelete = attr.AutoDelete,
+                                            QuorumGroupSize = attr.QuorumGroupSize > 0
+                                                ? attr.QuorumGroupSize
+                                                : _poolManager.GetOptions(consumerConfigId).QuorumGroupSize,
+                                        }).ConfigureAwait(false);
                                 }
-                                _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})", attr.ConsumerName, consumerConfigId);
+                                catch (OperationCanceledException)
+                                {
+                                    // 正常取消，不需要标记为不健康
+                                }
+                                catch (Exception ex)
+                                {
+                                    // 消费者任务异常（如连接断开），同步递减两个计数器使比率可自愈
+                                    lock (_healthLock)
+                                    {
+                                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
+                                        _totalConsumers = Math.Max(0, _totalConsumers - 1);
+                                    }
+                                    _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})", attr.ConsumerName, consumerConfigId);
+                                }
+                            });
+
+                            lock (_consumerTasks)
+                            {
+                                _consumerTasks.Add(task);
                             }
-                        });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 记录异常但继续处理其他消费者方法
+                        _logger.LogError(ex, "启动消费者 {ConsumerName} 时发生错误 (ConfigId: {ConfigId})", attr.ConsumerName, configId);
+                        continue;
                     }
                 }
-                catch (Exception ex)
-                {
-                    // 记录异常但继续处理其他消费者方法
-                    _logger.LogError(ex, "启动消费者 {ConsumerName} 时发生错误 (ConfigId: {ConfigId})", attr.ConsumerName, configId);
-                    continue;
-                }
+            }
+            finally
+            {
+                // 重置启动标志
+                _isStarting = false;
             }
         }
 

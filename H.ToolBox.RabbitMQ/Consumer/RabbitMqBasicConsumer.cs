@@ -93,7 +93,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         ///   <item><description>当 <see cref="_usingTaskRun"/> 为 false 时：直接在当前上下文中顺序处理消息</description></item>
         /// </list>
         /// </remarks>
-        public override Task HandleBasicDeliverAsync(string consumerTag, ulong deliveryTag, bool redelivered, string exchange,
+        public override async Task HandleBasicDeliverAsync(string consumerTag, ulong deliveryTag, bool redelivered, string exchange,
             string routingKey, IReadOnlyBasicProperties properties, ReadOnlyMemory<byte> body,
             CancellationToken cancellationToken = default)
         {
@@ -102,10 +102,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 复制消息体到安全副本，防止原始缓冲区被回收后数据丢失
                 ReadOnlyMemory<byte> safeBody = body.ToArray();
 
-                // 在独立的 Task 中异步处理消息，不阻塞消息接收循环
+                // Fire-and-forget：不 await，立即返回已完成的 Task，让通道继续分发下一条消息
                 // 实际并发度由 BasicQos(prefetchCount) 控制
                 // 不传 cancellationToken 给 Task.Run，避免通道取消时 Task 未执行即丢弃消息
-                return Task.Run(async () =>
+                _ = Task.Run(async () =>
                 {
                     await Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, safeBody);
                 });
@@ -113,7 +113,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
             else
             {
                 // 顺序处理模式：直接在当前上下文中消费消息
-                return Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, body);
+                await Consume(consumerTag, deliveryTag, redelivered, exchange, routingKey, properties, body);
             }
         }
 
@@ -231,7 +231,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步确认操作的任务</returns>
         public async Task BasicAck(ulong deliveryTag)
         {
-            if (Channel.IsOpen && !_isAutoAck)
+            if (Channel is { IsOpen: true } && !_isAutoAck)
                 await Channel.BasicAckAsync(deliveryTag, false).ConfigureAwait(false);
         }
 
@@ -242,9 +242,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="deliveryTag">消息投递标签</param>
         /// <param name="requeue">是否重新入队。为 false 时消息将进入死信队列（需配置 DLX），避免毒消息无限循环</param>
         /// <returns>表示异步拒绝操作的任务</returns>
-        public async Task BasicReject(ulong deliveryTag, bool requeue = false)
+        public async Task BasicReject(ulong deliveryTag, bool requeue = true)
         {
-            if (Channel.IsOpen && !_isAutoAck)
+            if (Channel is { IsOpen: true } && !_isAutoAck)
                 await Channel.BasicRejectAsync(deliveryTag, requeue).ConfigureAwait(false);
         }
     }

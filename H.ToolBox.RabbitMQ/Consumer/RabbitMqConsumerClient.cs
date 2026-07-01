@@ -76,7 +76,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步确认操作的任务</returns>
         public async Task CommitAsync(object? sender)
         {
-            await _consumer!.BasicAck((ulong)sender!).ConfigureAwait(false);
+            if (_consumer is null) throw new InvalidOperationException("消费者未初始化或已释放。");
+            if (sender is null) throw new ArgumentNullException(nameof(sender));
+            await _consumer.BasicAck((ulong)sender).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -87,7 +89,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <returns>表示异步拒绝操作的任务</returns>
         public async Task RejectAsync(object? sender)
         {
-            await _consumer!.BasicReject((ulong)sender!).ConfigureAwait(false);
+            if (_consumer is null) throw new InvalidOperationException("消费者未初始化或已释放。");
+            if (sender is null) throw new ArgumentNullException(nameof(sender));
+            await _consumer.BasicReject((ulong)sender).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -124,8 +128,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             // 确定预取消息数量，最小值为 1
             ushort prefetch = options.PrefetchCount > 0 ? options.PrefetchCount : (ushort)1;
 
-            // 判断是否为 Exchange 模式（有 RoutingKey 则为 Exchange 模式，否则为队列模式）
-            bool isExchangeMode = !string.IsNullOrWhiteSpace(options.RoutingKey);
+            // 判断是否为 Exchange 模式（配置了 Exchange 则为 Exchange 模式，否则为队列模式）
+            bool isExchangeMode = !string.IsNullOrWhiteSpace(options.Exchange);
 
             var queueName = options.QueueName;
             var consumerConcurrent = options.ConsumerConcurrent ;

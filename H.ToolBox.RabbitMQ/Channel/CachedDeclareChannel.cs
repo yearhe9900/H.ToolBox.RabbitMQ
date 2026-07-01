@@ -16,11 +16,6 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// 缓存附加到 IChannel 实例上，通道被 GC 时缓存自动回收
         /// </summary>
         private static readonly ConditionalWeakTable<IChannel, HashSet<string>> s_caches = new();
-#if NET10_0_OR_GREATER
-        private static readonly Lock s_cacheLock = new();
-#else
-        private static readonly object s_cacheLock = new();
-#endif
 
         private readonly IChannel _channel;
         private readonly HashSet<string> _declared;
@@ -93,15 +88,13 @@ namespace H.ToolBox.RabbitMQ.Channel
 
         private static HashSet<string> GetOrCreateCache(IChannel channel)
         {
-            lock (s_cacheLock)
-            {
-                if (s_caches.TryGetValue(channel, out var existing))
-                    return existing;
+            // ConditionalWeakTable 已线程安全，无需外层锁
+            if (s_caches.TryGetValue(channel, out var existing))
+                return existing;
 
-                var cache = new HashSet<string>(StringComparer.Ordinal);
-                s_caches.Add(channel, cache);
-                return cache;
-            }
+            var cache = new HashSet<string>(StringComparer.Ordinal);
+            s_caches.Add(channel, cache);
+            return cache;
         }
 
         private static string FormatArguments(IDictionary<string, object?>? arguments)

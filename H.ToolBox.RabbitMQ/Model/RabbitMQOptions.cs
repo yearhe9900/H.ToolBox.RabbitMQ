@@ -30,8 +30,10 @@ namespace H.ToolBox.RabbitMQ.Model
 
         /// <summary>
         /// RabbitMQ密码
+        /// 默认值 "guest" 匹配 RabbitMQ 默认凭据（guest/guest），
+        /// 生产环境请务必修改为强密码
         /// </summary>
-        public string Password { get; set; } = string.Empty;
+        public string Password { get; set; } = "guest";
 
         /// <summary>
         /// 虚拟主机
@@ -92,12 +94,6 @@ namespace H.ToolBox.RabbitMQ.Model
         /// 建议设置为奇数（如 3、5），且不超过集群节点数。
         /// </summary>
         public int? QuorumGroupSize { get; set; }
-
-        /// <summary>
-        /// 发布确认超时时间，超过此时间仍未收到 Broker 确认的消息将被视为失败，默认30秒。
-        /// 仅当 <see cref="PublishConfirms"/> 为 true 时生效。
-        /// </summary>
-        public TimeSpan PublishConfirmsTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
         /// <summary>
         /// 连接工厂自定义配置回调

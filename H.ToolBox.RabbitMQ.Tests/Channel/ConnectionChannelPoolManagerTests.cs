@@ -1,0 +1,152 @@
+using H.ToolBox.RabbitMQ.Channel;
+using H.ToolBox.RabbitMQ.Model;
+using Microsoft.Extensions.Logging;
+using Moq;
+
+namespace H.ToolBox.RabbitMQ.Tests.Channel;
+
+public class ConnectionChannelPoolManagerTests
+{
+    private readonly Mock<ILogger<ConnectionChannelPool>> _loggerMock = new();
+
+    private static RabbitMQOptions CreateOptions(string configId = "default")
+    {
+        return new RabbitMQOptions
+        {
+            ConfigId = configId,
+            HostName = new List<string> { "localhost" },
+            Port = 5672,
+            UserName = "guest",
+            Password = "guest"
+        };
+    }
+
+    [Fact]
+    public void RegisterPool_WithValidConfigId_ShouldSucceed()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        var options = CreateOptions();
+
+        // Act
+        var pool = manager.RegisterPool("default", options);
+
+        // Assert
+        Assert.NotNull(pool);
+    }
+
+    [Fact]
+    public void RegisterPool_WithDuplicateConfigId_ShouldThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        var options = CreateOptions();
+        manager.RegisterPool("default", options);
+
+        // Act & Assert
+        Assert.Throws<InvalidOperationException>(() => manager.RegisterPool("default", options));
+    }
+
+    [Fact]
+    public void RegisterPool_WithEmptyConfigId_ShouldThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+
+        // Act & Assert
+        Assert.Throws<ArgumentException>(() => manager.RegisterPool("", CreateOptions()));
+    }
+
+    [Fact]
+    public void GetPool_WithRegisteredConfigId_ShouldReturnPool()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("cluster1", CreateOptions("cluster1"));
+
+        // Act
+        var pool = manager.GetPool("cluster1");
+
+        // Assert
+        Assert.NotNull(pool);
+    }
+
+    [Fact]
+    public void GetPool_WithUnregisteredConfigId_ShouldThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+
+        // Act & Assert
+        Assert.Throws<KeyNotFoundException>(() => manager.GetPool("nonexistent"));
+    }
+
+    [Fact]
+    public void GetOptions_WithRegisteredConfigId_ShouldReturnOptions()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        var options = CreateOptions("cluster1");
+        manager.RegisterPool("cluster1", options);
+
+        // Act
+        var result = manager.GetOptions("cluster1");
+
+        // Assert
+        Assert.Same(options, result);
+    }
+
+    [Fact]
+    public void GetOptions_WithUnregisteredConfigId_ShouldThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+
+        // Act & Assert
+        Assert.Throws<KeyNotFoundException>(() => manager.GetOptions("nonexistent"));
+    }
+
+    [Fact]
+    public void Dispose_ShouldDisposeAllPools()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("c1", CreateOptions("c1"));
+        manager.RegisterPool("c2", CreateOptions("c2"));
+
+        // Act
+        manager.Dispose();
+
+        // Assert - getting pool after dispose should throw (pools cleared)
+        Assert.Throws<KeyNotFoundException>(() => manager.GetPool("c1"));
+    }
+
+    [Fact]
+    public void Dispose_CalledTwice_ShouldNotThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("c1", CreateOptions("c1"));
+
+        // Act & Assert
+        manager.Dispose();
+        var exception = Record.Exception(() => manager.Dispose());
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public void RegisterPool_MultipleClusters_ShouldIsolatePools()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+
+        // Act
+        manager.RegisterPool("c1", CreateOptions("c1"));
+        manager.RegisterPool("c2", CreateOptions("c2"));
+
+        // Assert
+        var pool1 = manager.GetPool("c1");
+        var pool2 = manager.GetPool("c2");
+        Assert.NotSame(pool1, pool2);
+    }
+}

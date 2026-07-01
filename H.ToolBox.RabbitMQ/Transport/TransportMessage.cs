@@ -1,5 +1,4 @@
 using H.ToolBox.RabbitMQ.Model;
-using System.Collections.Generic;
 
 namespace H.ToolBox.RabbitMQ.Transport
 {
@@ -77,12 +76,6 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 设置为 true 时，如果没有队列绑定匹配 routingKey，Broker 会将消息退回发布者。
         /// </summary>
         public bool Mandatory { get; set; } = false;
-
-        /// <summary>
-        /// 获取或设置发布失败时的最大重试次数，默认为 null（不重试）。
-        /// 设置为 0 也表示不重试。重试采用指数退避策略。
-        /// </summary>
-        public int? MaxRetries { get; set; } = null;
 
         /// <summary>
         /// 获取消息体的原始字节内容

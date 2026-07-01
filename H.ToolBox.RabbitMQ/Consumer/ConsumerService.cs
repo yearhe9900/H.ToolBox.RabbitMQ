@@ -40,7 +40,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <summary>
         /// 标识是否已释放资源
         /// </summary>
-        private bool _disposed;
+        private volatile bool _disposed;
 
         /// <summary>
         /// 初始化消费者服务实例
@@ -132,7 +132,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     _logger.LogError(ex, "消息反序列化失败，消息将被丢弃。Queue: {Queue}", queueName);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -145,11 +145,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     {
                         if (success)
                         {
-                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken).ConfigureAwait(false);
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                     }
                 }
@@ -158,7 +158,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     _logger.LogError(ex, "消息处理失败，Queue: {Queue}, DeliveryTag: {DeliveryTag}", queueName, ea.DeliveryTag);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     }
                 }
             };
@@ -284,7 +284,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     _logger.LogError(ex, "消息反序列化失败，消息将被丢弃。Queue: {Queue}", queueName);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -297,11 +297,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     {
                         if (success)
                         {
-                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: cancellationToken).ConfigureAwait(false);
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                     }
                 }
@@ -310,7 +310,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     _logger.LogError(ex, "消息处理失败，Exchange: {Exchange}, Queue: {Queue}, DeliveryTag: {DeliveryTag}", exchange, queueName, ea.DeliveryTag);
                     if (!autoAck)
                     {
-                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     }
                 }
             };

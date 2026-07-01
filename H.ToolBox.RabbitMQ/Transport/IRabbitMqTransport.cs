@@ -52,6 +52,6 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="maxRetries">发布失败时的最大重试次数，默认为 null（不重试）</param>
         /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
-        Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, bool mandatory = false, int? maxRetries = null, CancellationToken cancellationToken = default) where T : class;
+        Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, bool mandatory = false,  CancellationToken cancellationToken = default) where T : class;
     }
 }

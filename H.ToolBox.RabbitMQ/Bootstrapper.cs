@@ -69,7 +69,6 @@ namespace H.ToolBox.RabbitMQ
             // 注册取消回调，在服务停止时释放所有消费者注册器
             _cts.Token.Register(() =>
             {
-                _logger.LogDebug("RabbitMQ启动器正在停止...");
                 foreach (var processor in _processors)
                 {
                     try

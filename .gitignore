@@ -364,3 +364,4 @@ FodyWeavers.xsd
 
 # claude code
 .claude
+/rename.ps1

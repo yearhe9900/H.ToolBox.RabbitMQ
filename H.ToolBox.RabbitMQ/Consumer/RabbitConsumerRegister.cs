@@ -2,6 +2,7 @@
 using H.ToolBox.RabbitMQ.Model;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Linq.Expressions;
 using System.Reflection;
 
 namespace H.ToolBox.RabbitMQ.Consumer
@@ -309,6 +310,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     if (attr == null)
                         continue;
 
+                    // 编译委托，替代反射调用，提升消息处理性能
+                    CompileDelegate(methodScanResult.Value);
+
                     // 获取此消费者绑定的集群 ConfigId
                     var configId = attr.ConfigId ?? "default";
                     try
@@ -317,8 +321,9 @@ namespace H.ToolBox.RabbitMQ.Consumer
                         // 根据 ListenerCount 创建指定数量的并发消费者实例
                         for (var i = 0; i < attr.ListenerCount; i++)
                         {
-                            // 捕获当前 configId 用于闭包
+                            // 捕获当前 configId 和索引用于闭包
                             var consumerConfigId = configId;
+                            var consumerIndex = i;
 
                             lock (_healthLock)
                             {
@@ -337,13 +342,19 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                     // 注册消息处理和日志回调
                                     RegisterMessageProcessor(client);
 
+                                    // 为每个消费者实例生成唯一的 consumer tag（RabbitMQ 要求同一连接内 tag 唯一）
+                                    // 格式: ConsumerName-索引（多实例时追加后缀，单实例保持原名）
+                                    var consumerTag = attr.ListenerCount > 1
+                                        ? $"{attr.ConsumerName}-{consumerIndex}"
+                                        : attr.ConsumerName ?? string.Empty;
+
                                     // 启动消息监听，此方法会阻塞直到取消令牌被触发
                                     await client.ListeningAsync(
                                         TimeSpan.FromSeconds(attr.WaitOneTimeOut),
                                         cts.Token,
                                         new ListeningOptions()
                                         {
-                                            ConsumerName = attr.ConsumerName,
+                                            ConsumerName = consumerTag,
                                             Durable = attr.Durable,
                                             Exchange = attr.Exchange,
                                             ExchangeType = attr.ExchangeType,
@@ -465,63 +476,93 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 try
                 {
                     // 根据消费者标签（consumerTag）查找对应的方法执行器
+                    // 消费者标签格式可能为 "ConsumerName-索引"（多实例），需要回退到原始 ConsumerName 查找
                     var canFindSubscriber = _selector.TryGetExecutor(consumerTag, out var executor);
+                    if (!canFindSubscriber)
+                    {
+                        // 回退：去掉 "-索引" 后缀再查找
+                        var lastDash = consumerTag.LastIndexOf('-');
+                        if (lastDash > 0)
+                        {
+                            var baseName = consumerTag[..lastDash];
+                            canFindSubscriber = _selector.TryGetExecutor(baseName, out executor);
+                        }
+                    }
                     if (canFindSubscriber)
                     {
                         if (executor == null)
                             return;
 
-                        var instance = executor.Instance;
-                        var methodInfo = executor.MethodInfo;
                         try
                         {
-                            // 校验方法签名：要求 (string, string) 或 (string, string, CancellationToken)
-                            var parameters = methodInfo!.GetParameters();
-                            if (parameters.Length < 2
-                                || parameters[0].ParameterType != typeof(string)
-                                || parameters[1].ParameterType != typeof(string))
+                            // 优先使用编译后的委托，避免反射调用开销
+                            if (executor.CompiledDelegate != null)
                             {
-                                _logger.LogError("消费者方法 {Method} 签名不符合要求，需要 (string, string) 参数", methodInfo.Name);
-                                await client.CommitAsync(sender).ConfigureAwait(false);
-                                return;
-                            }
+                                var canCommit = await executor.CompiledDelegate(message.BodyContent, message.RoutingKey).ConfigureAwait(false);
 
-                            // 构造方法参数：[消息内容, 路由键]
-#if NET10_0_OR_GREATER
-                            object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
-                                ? [message.BodyContent, message.RoutingKey, CancellationToken.None]
-                                : [message.BodyContent, message.RoutingKey];
-#else
-                            object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
-                                ? new object?[] { message.BodyContent, message.RoutingKey, CancellationToken.None }
-                                : new object?[] { message.BodyContent, message.RoutingKey };
-#endif
-                            // 通过反射调用目标消费者方法
-                            var result = methodInfo!.Invoke(instance, invokeParams);
-                            var canCommit = true;
-
-                            // 根据返回类型处理结果，用于决定消息确认或拒绝
-                            if (result is Task<bool> boolTask)
-                            {
-                                canCommit = await boolTask.ConfigureAwait(false);
-                            }
-                            else if (result is Task taskResult)
-                            {
-                                await taskResult.ConfigureAwait(false);
-                            }
-                            else if (result is bool boolResult)
-                            {
-                                canCommit = boolResult;
-                            }
-
-                            // 根据处理结果决定确认或拒绝消息
-                            if (canCommit)
-                            {
-                                await client.CommitAsync(sender).ConfigureAwait(false);
+                                if (canCommit)
+                                {
+                                    await client.CommitAsync(sender).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    await client.RejectAsync(sender).ConfigureAwait(false);
+                                }
                             }
                             else
                             {
-                                await client.RejectAsync(sender).ConfigureAwait(false);
+                                // 回退到反射调用（理论上不应走到这里）
+                                var instance = executor.Instance;
+                                var methodInfo = executor.MethodInfo;
+
+                                // 校验方法签名：要求 (string, string) 或 (string, string, CancellationToken)
+                                var parameters = methodInfo!.GetParameters();
+                                if (parameters.Length < 2
+                                    || parameters[0].ParameterType != typeof(string)
+                                    || parameters[1].ParameterType != typeof(string))
+                                {
+                                    _logger.LogError("消费者方法 {Method} 签名不符合要求，需要 (string, string) 参数", methodInfo.Name);
+                                    await client.CommitAsync(sender).ConfigureAwait(false);
+                                    return;
+                                }
+
+                                // 构造方法参数：[消息内容, 路由键]
+#if NET10_0_OR_GREATER
+                                object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
+                                    ? [message.BodyContent, message.RoutingKey, CancellationToken.None]
+                                    : [message.BodyContent, message.RoutingKey];
+#else
+                                object?[] invokeParams = parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken)
+                                    ? new object?[] { message.BodyContent, message.RoutingKey, CancellationToken.None }
+                                    : new object?[] { message.BodyContent, message.RoutingKey };
+#endif
+                                // 通过反射调用目标消费者方法
+                                var result = methodInfo!.Invoke(instance, invokeParams);
+                                var canCommit = true;
+
+                                // 根据返回类型处理结果，用于决定消息确认或拒绝
+                                if (result is Task<bool> boolTask)
+                                {
+                                    canCommit = await boolTask.ConfigureAwait(false);
+                                }
+                                else if (result is Task taskResult)
+                                {
+                                    await taskResult.ConfigureAwait(false);
+                                }
+                                else if (result is bool boolResult)
+                                {
+                                    canCommit = boolResult;
+                                }
+
+                                // 根据处理结果决定确认或拒绝消息
+                                if (canCommit)
+                                {
+                                    await client.CommitAsync(sender).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    await client.RejectAsync(sender).ConfigureAwait(false);
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -543,6 +584,122 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     await client.RejectAsync(sender).ConfigureAwait(false);
                 }
             };
+        }
+
+        /// <summary>
+        /// 编译消费者方法的委托，替代反射调用以提升性能
+        /// 使用 Expression Tree 将方法调用编译为原生委托，避免每条消息的反射开销
+        /// </summary>
+        /// <param name="scanResult">方法扫描结果，包含实例、方法信息等</param>
+        private void CompileDelegate(MethodScanResult scanResult)
+        {
+            try
+            {
+                var methodInfo = scanResult.MethodInfo;
+                var instance = scanResult.Instance;
+
+                if (methodInfo == null || instance == null)
+                    return;
+
+                // 校验方法签名
+                var parameters = methodInfo.GetParameters();
+                if (parameters.Length < 2
+                    || parameters[0].ParameterType != typeof(string)
+                    || parameters[1].ParameterType != typeof(string))
+                {
+                    return;
+                }
+
+                // 构建表达式树参数
+                var sourceParam = Expression.Parameter(typeof(string), "source");
+                var routingKeyParam = Expression.Parameter(typeof(string), "routingKey");
+                var instanceConst = Expression.Constant(instance);
+
+                // 构建方法调用表达式
+                Expression[] callArgs;
+                if (parameters.Length >= 3 && parameters[2].ParameterType == typeof(CancellationToken))
+                {
+                    callArgs = new Expression[] { sourceParam, routingKeyParam, Expression.Constant(CancellationToken.None) };
+                }
+                else
+                {
+                    callArgs = new Expression[] { sourceParam, routingKeyParam };
+                }
+
+                var callExpr = Expression.Call(instanceConst, methodInfo, callArgs);
+
+                // 根据返回类型构建统一的 Func<string, string, Task<bool>> 委托
+                var returnType = methodInfo.ReturnType;
+
+                Expression body;
+
+                if (returnType == typeof(Task<bool>))
+                {
+                    // 方法返回 Task<bool>，直接使用
+                    body = callExpr;
+                }
+                else if (returnType == typeof(Task))
+                {
+                    // 方法返回 Task（无返回值），包装为 Task<bool> = true
+                    var taskVar = Expression.Variable(typeof(Task), "task");
+                    var block = Expression.Block(
+                        new[] { taskVar },
+                        Expression.Assign(taskVar, callExpr),
+                        Expression.Call(typeof(CompileDelegateHelper), nameof(CompileDelegateHelper.AwaitTaskAndReturnTrue), null, taskVar)
+                    );
+                    body = block;
+                }
+                else if (returnType == typeof(bool))
+                {
+                    // 方法返回 bool，包装为 Task.FromResult<bool>
+                    body = Expression.Call(typeof(Task), nameof(Task.FromResult), new[] { typeof(bool) }, callExpr);
+                }
+                else if (returnType == typeof(void))
+                {
+                    // 方法返回 void，调用后返回 Task.FromResult(true)
+                    var block = Expression.Block(
+                        callExpr,
+                        Expression.Field(null, typeof(CompileDelegateHelper), nameof(CompileDelegateHelper.TrueTask))
+                    );
+                    body = block;
+                }
+                else
+                {
+                    // 不支持的返回类型，跳过编译
+                    return;
+                }
+
+                // 编译为委托
+                var lambda = Expression.Lambda<Func<string, string, Task<bool>>>(
+                    body, sourceParam, routingKeyParam);
+
+                scanResult.CompiledDelegate = lambda.Compile();
+            }
+            catch (Exception ex)
+            {
+                // 编译失败时记录警告，回退到反射调用
+                _logger.LogWarning(ex, "编译消费者方法委托失败，将回退到反射调用。Method: {Method}", scanResult.MethodInfo?.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 编译委托辅助类，提供 Expression Tree 中使用的静态方法
+    /// </summary>
+    internal static class CompileDelegateHelper
+    {
+        /// <summary>
+        /// 预创建的 Task.FromResult(true)，避免重复创建
+        /// </summary>
+        public static readonly Task<bool> TrueTask = Task.FromResult(true);
+
+        /// <summary>
+        /// 等待 Task 完成后返回 true
+        /// </summary>
+        public static async Task<bool> AwaitTaskAndReturnTrue(Task task)
+        {
+            await task.ConfigureAwait(false);
+            return true;
         }
     }
 }

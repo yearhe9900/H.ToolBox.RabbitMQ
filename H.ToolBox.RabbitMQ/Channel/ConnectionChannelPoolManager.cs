@@ -11,6 +11,7 @@ namespace H.ToolBox.RabbitMQ.Channel
     public class ConnectionChannelPoolManager : IConnectionChannelPoolManager, IDisposable
     {
         private readonly ConcurrentDictionary<string, IConnectionChannelPool> _pools = new();
+        private readonly ConcurrentDictionary<string, IConnectionChannelPool> _producerPools = new();
         private readonly ConcurrentDictionary<string, RabbitMQOptions> _options = new();
         private readonly ILogger<ConnectionChannelPool> _poolLogger;
 
@@ -24,7 +25,7 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
-        /// 根据 ConfigId 获取对应的连接通道池
+        /// 根据 ConfigId 获取对应的连接通道池（消费者专用）
         /// 如果对应的池不存在，则使用提供的配置创建一个新的连接通道池
         /// </summary>
         /// <param name="configId">集群配置标识</param>
@@ -38,6 +39,23 @@ namespace H.ToolBox.RabbitMQ.Channel
             }
 
             throw new KeyNotFoundException($"未找到 ConfigId 为 '{configId}' 的连接通道池，请确保已通过 AddRabbitMQ 注册该集群配置。");
+        }
+
+        /// <summary>
+        /// 根据 ConfigId 获取对应的生产者专用连接通道池
+        /// 生产者池与消费者池使用独立的 TCP 连接，避免连接级背压相互影响
+        /// </summary>
+        /// <param name="configId">集群配置标识，默认为 "default"</param>
+        /// <returns>对应集群的生产者专用连接通道池</returns>
+        /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
+        public IConnectionChannelPool GetProducerPool(string configId = "default")
+        {
+            if (_producerPools.TryGetValue(configId, out var pool))
+            {
+                return pool;
+            }
+
+            throw new KeyNotFoundException($"未找到 ConfigId 为 '{configId}' 的生产者连接通道池，请确保已通过 AddRabbitMQ 注册该集群配置。");
         }
 
         /// <summary>
@@ -70,11 +88,21 @@ namespace H.ToolBox.RabbitMQ.Channel
                 throw new ArgumentException("ConfigId 不能为空。", nameof(configId));
 
             var pool = new ConnectionChannelPool(_poolLogger, options);
+            var producerPool = new ConnectionChannelPool(_poolLogger, options);
 
             if (!_pools.TryAdd(configId, pool))
             {
                 pool.Dispose();
+                producerPool.Dispose();
                 throw new InvalidOperationException($"ConfigId 为 '{configId}' 的连接通道池已注册，不可重复注册。");
+            }
+
+            if (!_producerPools.TryAdd(configId, producerPool))
+            {
+                _pools.TryRemove(configId, out _);
+                pool.Dispose();
+                producerPool.Dispose();
+                throw new InvalidOperationException($"ConfigId 为 '{configId}' 的生产者连接通道池已注册，不可重复注册。");
             }
 
             _options.TryAdd(configId, options);
@@ -95,6 +123,15 @@ namespace H.ToolBox.RabbitMQ.Channel
                 }
             }
             _pools.Clear();
+
+            foreach (var kvp in _producerPools)
+            {
+                if (kvp.Value is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+            _producerPools.Clear();
         }
     }
 }

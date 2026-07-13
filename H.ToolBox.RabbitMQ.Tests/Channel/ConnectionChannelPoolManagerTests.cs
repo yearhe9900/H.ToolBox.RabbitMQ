@@ -149,4 +149,58 @@ public class ConnectionChannelPoolManagerTests
         var pool2 = manager.GetPool("c2");
         Assert.NotSame(pool1, pool2);
     }
+
+    [Fact]
+    public void GetProducerPool_WithRegisteredConfigId_ShouldReturnProducerPool()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("cluster1", CreateOptions("cluster1"));
+
+        // Act
+        var producerPool = manager.GetProducerPool("cluster1");
+
+        // Assert
+        Assert.NotNull(producerPool);
+    }
+
+    [Fact]
+    public void GetProducerPool_WithUnregisteredConfigId_ShouldThrow()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+
+        // Act & Assert
+        Assert.Throws<KeyNotFoundException>(() => manager.GetProducerPool("nonexistent"));
+    }
+
+    [Fact]
+    public void GetProducerPool_ShouldReturnDifferentInstanceFromGetPool()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("cluster1", CreateOptions("cluster1"));
+
+        // Act
+        var consumerPool = manager.GetPool("cluster1");
+        var producerPool = manager.GetProducerPool("cluster1");
+
+        // Assert - producer and consumer pools must be different instances (separate TCP connections)
+        Assert.NotSame(consumerPool, producerPool);
+    }
+
+    [Fact]
+    public void GetProducerPool_CalledTwice_ShouldReturnSameInstance()
+    {
+        // Arrange
+        var manager = new ConnectionChannelPoolManager(_loggerMock.Object);
+        manager.RegisterPool("cluster1", CreateOptions("cluster1"));
+
+        // Act
+        var pool1 = manager.GetProducerPool("cluster1");
+        var pool2 = manager.GetProducerPool("cluster1");
+
+        // Assert - producer pool should be stable per ConfigId
+        Assert.Same(pool1, pool2);
+    }
 }

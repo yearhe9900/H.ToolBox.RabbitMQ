@@ -93,8 +93,9 @@ namespace H.ToolBox.RabbitMQ.Transport
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            // 根据 ConfigId 获取对应集群的连接通道池
-            var connectionChannelPool = _poolManager.GetPool(message.ConfigId);
+            // 根据 ConfigId 获取对应集群的生产者专用连接通道池
+            // 使用独立连接，避免生产者高速发送时的连接级背压影响消费者 ACK
+            var connectionChannelPool = _poolManager.GetProducerPool(message.ConfigId);
 
             IChannel? channel = null;
             Task<bool>? confirmTask = null;

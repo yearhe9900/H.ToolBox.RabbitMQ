@@ -296,6 +296,10 @@ public class ConsumerWorker : BackgroundService
 | `exclusive` | false | 是否独占队列 |
 | `autoDelete` | false | 是否自动删除 |
 | `consumerTag` | "" | 消费者标签（空则由 RabbitMQ 自动生成） |
+| `ackBatchSize` | 100 | 批量确认累积条数，达到即 flush；`<=0` 退化为逐条确认 |
+| `ackFlushIntervalMs` | 10 | 批量确认定时刷新间隔（毫秒），低吞吐兜底；`<=0` 退化为逐条确认 |
+
+> **说明**：`ackBatchSize` / `ackFlushIntervalMs` 自下一版本迭代（见 `PLAN.md`）起生效，声明式消费通过 `[RabbitMQConsumer(AckBatchSize, AckFlushIntervalMs)]` 配置，命令式消费通过 `IConsumerService` 同名可选参数配置。
 
 ---
 
@@ -330,6 +334,9 @@ public class ConsumerWorker : BackgroundService
 
 ### 📨 消息持久化与确认机制
 默认开启消息持久化（`DeliveryModes.Persistent`）和手动确认（`AutoAck = false`），确保消息不丢失。处理成功后自动 Ack，处理失败自动 Reject 并重新入队。
+
+### 📦 批量累积确认（AckBatcher）
+消费确认（ACK）由新增的 `AckBatcher` 组件统一调度（下一版本迭代，详见 `PLAN.md`）：在单个 channel 上维护「已确认连续 deliveryTag 区间」，当累积完成的消息达到 `AckBatchSize`（默认 100）或距上次刷新超过 `AckFlushIntervalMs`（默认 10ms）任一条件触发时，发送一次 `BasicAckAsync(maxTag, multiple:true)` 累积确认，将高吞吐场景下的 AMQP 确认帧数量降低 1~2 个数量级。并发乱序完成（`ConsumerConcurrent > 1`）时，依据完成顺序补齐连续前缀，避免 `multiple:true` 误确认未处理消息；Reject 前会先 flush 连续 ACK，再单独拒绝（multiple:false）。`<=0` 时退化为逐条确认，便于灰度。
 
 ### 🔗 多主机集群支持
 `HostName` 支持配置多个地址，实现 RabbitMQ 集群的高可用和负载均衡。

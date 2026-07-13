@@ -41,7 +41,8 @@ H.ToolBox.RabbitMQ/
 │   │   ├── RabbitMqConsumerClient.cs                  #   消费者客户端实现 (消息监听)
 │   │   ├── IRabbitMqConsumerClientFactory.cs          #   消费者客户端工厂接口 (支持 ConfigId)
 │   │   ├── RabbitMqConsumerClientFactory.cs           #   消费者客户端工厂实现 (多集群)
-│   │   ├── RabbitMqBasicConsumer.cs                   #   异步基础消费者 (Ack/Reject)
+│   │   ├── RabbitMqBasicConsumer.cs                   #   异步基础消费者 (Ack/Reject，接入 AckBatcher)
+│   │   ├── AckBatcher.cs                              #   批量累积确认器 (维护连续 deliveryTag 区间，N条/定时混合触发)
 │   │   ├── IConsumerService.cs                        #   消费者服务接口 (ListenAsync/ListenByExchangeAsync)
 │   │   └── ConsumerService.cs                         #   消费者服务实现 (通过channelPool获取channel)
 │   │
@@ -198,9 +199,23 @@ classDiagram
         -Action _logCallback
         -bool _usingTaskRun
         -bool _isAutoAck
+        -AckBatcher _ackBatcher
         +HandleBasicDeliverAsync(...) Task
         +BasicAck(ulong) Task
         +BasicReject(ulong) Task
+    }
+
+    class AckBatcher {
+        -IChannel _channel
+        -int _batchSize
+        -TimeSpan _flushInterval
+        -ulong _nextToAck
+        -SortedSet~ulong~ _pending
+        -Timer _timer
+        +RecordAck(ulong) void
+        +RecordReject(ulong, bool) void
+        +Flush() void
+        +Dispose() void
     }
 
     class ConnectionChannelPool {
@@ -286,6 +301,8 @@ classDiagram
         +ListenerCount int
         +WaitOneTimeOut int
         +ConsumerConcurrent byte
+        +AckBatchSize int
+        +AckFlushIntervalMs int
     }
 
     class TransportMessage {
@@ -313,6 +330,7 @@ classDiagram
     RabbitMqConsumerClientFactory --> RabbitMqConsumerClient : 创建
     RabbitMqConsumerClient ..|> IRabbitMqConsumerClient
     RabbitMqConsumerClient --> RabbitMqBasicConsumer : 创建并使用
+    RabbitMqBasicConsumer --> AckBatcher : 批量确认
     RabbitMqConsumerClient --> IConnectionChannelPool : 获取连接
     ConnectionChannelPool ..|> IConnectionChannelPool
     ConnectionChannelPoolManager ..|> IConnectionChannelPoolManager
@@ -397,7 +415,10 @@ sequenceDiagram
     Service-->>Reg: 方法执行完成
     Reg->>Client: CommitAsync(deliveryTag)
     Client->>Consumer: BasicAck(deliveryTag)
-    Consumer->>MQ: BasicAckAsync(deliveryTag)
+    Consumer->>Consumer: AckBatcher.RecordAck(deliveryTag)
+    alt 达到 AckBatchSize 或 定时触发（下一版本迭代，见 PLAN.md）
+        Consumer->>MQ: BasicAckAsync(maxTag, multiple:true)
+    end
 ```
 
 ### 4.3 多集群消息发布流程 (生产者)
@@ -487,7 +508,8 @@ graph LR
 | `RabbitConsumerRegister` | **单实例**消费者注册器，遍历所有消费者方法，根据每个消费者的 `ConfigId` 自动选择对应集群的连接池创建客户端。无集群隔离，统一管理 |
 | `RabbitMqConsumerClientFactory` | 工厂模式，通过 `IConnectionChannelPoolManager` 按 ConfigId 获取对应集群的连接池，创建消费者客户端 |
 | `RabbitMqConsumerClient` | 核心消费者客户端，负责建立连接、声明队列/交换机、设置 QoS、注册消费者并持续监听消息 |
-| `RabbitMqBasicConsumer` | 继承 `AsyncDefaultBasicConsumer`，接收消息并解码为 `TransportMessage`，支持并发控制，提供消息确认和拒绝功能 |
+| `RabbitMqBasicConsumer` | 继承 `AsyncDefaultBasicConsumer`，接收消息并解码为 `TransportMessage`，支持并发控制，提供消息确认和拒绝功能；确认/拒绝委托给 `AckBatcher` 统一批量调度 |
+| `AckBatcher` | 批量累积确认器（下一版本迭代，见 `PLAN.md`）。维护「已确认连续 deliveryTag 区间」（游标 `_nextToAck` + `SortedSet<ulong> _pending`），达到 `AckBatchSize` 条或 `AckFlushIntervalMs` 定时阈值即发送 `BasicAckAsync(maxTag, multiple:true)`；并发乱序完成时按完成顺序补齐连续前缀避免误确认；Reject 前先 flush 连续 ACK 再单独拒绝；内部加锁串行化 AMQP 发送，通道关闭/释放时兜底 flush |
 | `IConsumerService` | 消费者服务接口，提供 `ListenAsync`（队列消费）和 `ListenByExchangeAsync`（路由消费）两种方法，通过 `configId` 从 `IConnectionChannelPoolManager` 获取对应集群的连接通道池 |
 | `ConsumerService` | 消费者服务实现，通过 `IConnectionChannelPool` 获取 channel，使用 `AsyncEventingBasicConsumer` 的 `ReceivedAsync` 事件驱动方式消费消息，支持泛型反序列化、Ack/Reject、通道生命周期管理 |
 
@@ -504,7 +526,7 @@ graph LR
 |---|---|
 | `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`PoolSize` 初始通道数（默认15）、`AbsoluteMaxPoolSize` 动态扩展上限（默认128）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
 | `MethodMatcherCache` | 方法匹配缓存，`TrySetExecutor()` 校验 ConsumerName 唯一性（重复则抛异常），`TrySetExecutor(configId)` 按集群筛选 |
-| `RabbitMQConsumerAttribute` | 消费者特性，含 `ConfigId` 指定消费者绑定的集群、`WaitOneTimeOut` 轮询超时、`ConsumerConcurrent` 并发处理级别 |
+| `RabbitMQConsumerAttribute` | 消费者特性，含 `ConfigId` 指定消费者绑定的集群、`WaitOneTimeOut` 轮询超时、`ConsumerConcurrent` 并发处理级别、`AckBatchSize` 批量确认累积条数（默认 100）、`AckFlushIntervalMs` 批量确认定时刷新间隔（默认 10） |
 
 ### 6.5 根级别
 

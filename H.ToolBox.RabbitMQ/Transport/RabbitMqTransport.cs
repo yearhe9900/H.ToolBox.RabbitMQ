@@ -5,6 +5,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Exceptions;
+using System.IO;
+using System.Net.Sockets;
 
 namespace H.ToolBox.RabbitMQ.Transport
 {
@@ -97,118 +99,133 @@ namespace H.ToolBox.RabbitMQ.Transport
             // 使用独立连接，避免生产者高速发送时的连接级背压影响消费者 ACK
             var connectionChannelPool = _poolManager.GetProducerPool(message.ConfigId);
 
-            IChannel? channel = null;
-            Task<bool>? confirmTask = null;
-            try
+            // 读取该集群的瞬时故障重试次数（仅对连接/通道中断等可恢复错误生效）
+            var maxRetries = Math.Max(0, _poolManager.GetOptions(message.ConfigId).MaxRetries);
+
+            Exception? lastException = null;
+
+            for (var attempt = 0; attempt <= maxRetries; attempt++)
             {
-                // 从连接通道池中租借一个可用通道
-                channel = await connectionChannelPool.Rent(cancellationToken).ConfigureAwait(false);
-
-                // 用 CachedDeclareChannel 包装，对同一个 exchange/queue 的声明操作自动跳过
-                var cached = new CachedDeclareChannel(channel);
-
-                if (hasExchangeMode)
+                IChannel? channel = null;
+                Task<bool>? confirmTask = null;
+                try
                 {
-                    // 交换机模式：首次声明后缓存，后续同参数调用直接跳过
-                    await cached.ExchangeDeclareAsync(message.Exchange, message.ExchangeType, message.Durable ?? _durable, message.AutoDelete, cancellationToken).ConfigureAwait(false);
+                    // 从连接通道池中租借一个可用通道
+                    channel = await connectionChannelPool.Rent(cancellationToken).ConfigureAwait(false);
+
+                    // 用 CachedDeclareChannel 包装，对同一个 exchange/queue 的声明操作自动跳过
+                    var cached = new CachedDeclareChannel(channel);
+
+                    if (hasExchangeMode)
+                    {
+                        // 交换机模式：首次声明后缓存，后续同参数调用直接跳过
+                        await cached.ExchangeDeclareAsync(message.Exchange, message.ExchangeType, message.Durable ?? _durable, message.AutoDelete, cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // 队列模式：根据队列类型构建声明参数
+                        var queueArguments = QueueArgumentsHelper.BuildArguments(message.QueueType, message.QuorumGroupSize);
+
+                        // 队列模式：首次声明后缓存，后续同参数调用直接跳过
+                        await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, message.Exclusive, message.AutoDelete, message.QueueType, queueArguments, cancellationToken).ConfigureAwait(false);
+
+                        // 队列模式下若未指定 RoutingKey，则使用队列名作为 RoutingKey
+                        // 默认交换机会将 RoutingKey 与队列名完全匹配的消息路由到对应队列
+                        if (string.IsNullOrEmpty(message.RoutingKey))
+                        {
+                            message.RoutingKey = message.QueueName;
+                        }
+                    }
+
+                    var props = s_basicProperties;
+
+                    await channel.BasicPublishAsync(
+                        exchange: message.Exchange,
+                        routingKey: message.RoutingKey,
+                        mandatory: message.Mandatory,
+                        basicProperties: props,
+                        body: message.Body,
+                        cancellationToken: cancellationToken
+                        ).ConfigureAwait(false);
+
+                    // 立即归还 channel 到池，不阻塞等待 ACK，让其他任务可以复用此 channel
+                    connectionChannelPool.Return(channel);
+                    channel = null; // 避免下方异常处理中重复归还
+
+                    if (confirmTask != null)
+                    {
+                        var ackResult = await confirmTask.ConfigureAwait(false);
+                        if (!ackResult)
+                        {
+                            throw new InvalidOperationException("消息被 Broker 拒绝（NACK）");
+                        }
+                    }
+
+                    return OperateResult.Success;
                 }
-                else
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    // 队列模式：根据队列类型构建声明参数
-                    var queueArguments = QueueArgumentsHelper.BuildArguments(message.QueueType, message.QuorumGroupSize);
-
-                    // 队列模式：首次声明后缓存，后续同参数调用直接跳过
-                    await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, message.Exclusive, message.AutoDelete, message.QueueType, queueArguments, cancellationToken).ConfigureAwait(false);
-
-                    // 队列模式下若未指定 RoutingKey，则使用队列名作为 RoutingKey
-                    // 默认交换机会将 RoutingKey 与队列名完全匹配的消息路由到对应队列
-                    if (string.IsNullOrEmpty(message.RoutingKey))
-                    {
-                        message.RoutingKey = message.QueueName;
-                    }
+                    // 只有当调用方主动取消时才抛出，其他情况（如连接超时）应作为失败处理
+                    throw;
                 }
-
-                var props = s_basicProperties;
-
-                await channel.BasicPublishAsync(
-                    exchange: message.Exchange,
-                    routingKey: message.RoutingKey,
-                    mandatory: message.Mandatory,
-                    basicProperties: props,
-                    body: message.Body,
-                    cancellationToken: cancellationToken
-                    ).ConfigureAwait(false);
-
-                // 立即归还 channel 到池，不阻塞等待 ACK，让其他任务可以复用此 channel
-                connectionChannelPool.Return(channel);
-                channel = null; // 避免 finally 中重复归还
-
-                if (confirmTask != null)
+                catch (Exception ex)
                 {
-                    var ackResult = await confirmTask.ConfigureAwait(false);
-                    if (!ackResult)
-                    {
-                        throw new InvalidOperationException("消息被 Broker 拒绝（NACK）");
-                    }
-                }
+                    lastException = ex;
 
-                return OperateResult.Success;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                // 只有当调用方主动取消时才抛出，其他情况（如连接超时）应作为失败处理
-                throw;
-            }
-            catch (Exception ex)
-            {
-                // 通道已关闭但状态标记不一致（IsOpen 仍为 true）时，强制释放该通道以避免资源泄漏
-                if (ex is AlreadyClosedException && channel?.IsOpen == true)
-                {
-                    _logger.LogWarning("检测到通道状态不一致：通道显示为已打开，但其底层连接已关闭。正在强制关闭该通道。");
-                    await channel.DisposeAsync().ConfigureAwait(false);
-                }
-
-                // 归还当前通道（异常通道不会被复用，Return 内部会 Dispose）
-                if (channel != null)
-                {
-                    try
+                    // 归还/释放当前通道：异常通道不会被复用，Return 内部会对已关闭通道做 Dispose
+                    if (channel != null)
                     {
-                        connectionChannelPool.Return(channel);
-                        channel = null; // 避免 finally 中重复归还
-                    }
-                    catch (Exception returnEx)
-                    {
-                        _logger.LogWarning(returnEx, "归还异常通道到池时发生异常");
-                    }
-                }
+                        // 通道状态不一致（IsOpen 仍为 true 但其底层连接已关闭）时，先强制关闭再归还
+                        if (ex is AlreadyClosedException && channel.IsOpen)
+                        {
+                            _logger.LogWarning("检测到通道状态不一致：通道显示为已打开，但其底层连接已关闭。正在强制关闭该通道。");
+                            try { await channel.DisposeAsync().ConfigureAwait(false); } catch { /* 忽略 */ }
+                        }
 
-                _logger.LogError(ex, "消息发布失败，队列: {QueueName}, ConfigId: {ConfigId}, 错误: {ErrorMessage}",
-                    message.QueueName, message.ConfigId, ex.Message);
-
-                var finalWrapperEx = new PublisherSentFailedException(ex.Message, ex);
-                var errors = new OperateError
-                {
-                    Code = ex.HResult.ToString(),
-                    Description = ex.Message
-                };
-
-                return OperateResult.Failed(finalWrapperEx, errors);
-            }
-            finally
-            {
-                // 无论发布成功或失败，都确保通道被归还到连接池，防止通道泄漏
-                if (channel != null)
-                {
-                    try
-                    {
-                        connectionChannelPool.Return(channel);
+                        try { connectionChannelPool.Return(channel); } catch { /* 忽略 */ }
+                        channel = null; // 避免下方异常处理中重复归还
                     }
-                    catch (Exception ex)
+
+                    // 仅对瞬时 AMQP 错误且在重试次数内才重试，避免无意义的无效重试
+                    if (attempt >= maxRetries || !IsTransientAmqpException(ex))
                     {
-                        _logger.LogWarning(ex, "归还通道到池时发生异常");
+                        break;
                     }
+
+                    // 指数退避后重试（100ms、200ms、400ms …，上限 2s）
+                    var backoffMs = (int)Math.Min(2000, Math.Pow(2, attempt) * 100);
+                    _logger.LogWarning(ex, "消息发布遇到瞬时故障，{Delay}ms 后进行第 {Next} 次重试（共 {Max} 次）。", backoffMs, attempt + 1, maxRetries);
+                    await Task.Delay(backoffMs, cancellationToken).ConfigureAwait(false);
                 }
             }
+
+            _logger.LogError(lastException, "消息发布失败（已达重试上限），队列: {QueueName}, ConfigId: {ConfigId}", message.QueueName, message.ConfigId);
+
+            var finalException = lastException ?? new InvalidOperationException("消息发布失败，原因未知。");
+            var finalWrapperEx = new PublisherSentFailedException(finalException.Message, finalException);
+            var errors = new OperateError
+            {
+                Code = finalException.HResult.ToString(),
+                Description = finalException.Message
+            };
+
+            return OperateResult.Failed(finalWrapperEx, errors);
+        }
+
+        /// <summary>
+        /// 判断异常是否为可恢复的瞬时 AMQP 错误。
+        /// 连接/通道在途被关闭（Already closed / The AMQP operation was interrupted）、
+        /// AMQP 操作被中断、Broker 不可达、底层 IO/网络异常、超时均属于可重试范畴；
+        /// 参数校验失败、消息格式错误等不可恢复错误应直接失败，不进行重试。
+        /// </summary>
+        private static bool IsTransientAmqpException(Exception ex)
+        {
+            return ex is AlreadyClosedException
+                || ex is OperationInterruptedException
+                || ex is BrokerUnreachableException
+                || ex is IOException
+                || ex is SocketException
+                || ex is TimeoutException;
         }
 
         /// <summary>

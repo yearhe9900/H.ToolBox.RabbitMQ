@@ -77,6 +77,26 @@ namespace H.ToolBox.RabbitMQ.Model
         public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
         /// <summary>
+        /// 连接池大小（TCP 连接数量），默认值为 2。
+        /// 单个 RabbitMQ 连接上的所有 AMQP 帧由同一条 TCP 通道串行处理，
+        /// 在推送压力较大时容易成为瓶颈；配置多条连接可将通道与发布请求均匀分摊到多条 TCP 连接上，
+        /// 显著提升高吞吐场景下的发布性能并降低相互阻塞。
+        /// 取值建议：高吞吐生产者 2~4；普通场景 2 即可；设置为 1 将回退为原有的单连接行为。
+        /// 内部会强制约束在 [1, 64] 区间。
+        /// </summary>
+        public int ConnectionCount { get; set; } = 2;
+
+        /// <summary>
+        /// 发布失败时的瞬时故障重试次数，默认值为 3。
+        /// 仅针对连接/通道中断等可恢复的瞬时错误（如 AlreadyClosedException、
+        /// OperationInterruptedException、Broker 不可达、底层 IO/网络异常、超时）生效；
+        /// 参数校验失败、消息格式错误等不可恢复错误不会重试。
+        /// 重试采用指数退避（100ms、200ms、400ms …，上限 2s）。
+        /// 设置为 0 可禁用重试。
+        /// </summary>
+        public int MaxRetries { get; set; } = 3;
+
+        /// <summary>
         /// 消费者线程数，控制并发消费的并行度
         /// </summary>
         public int ConsumerThreadCount { get; set; } = 1;

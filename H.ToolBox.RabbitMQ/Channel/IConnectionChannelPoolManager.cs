@@ -33,5 +33,13 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// <returns>对应集群的配置选项</returns>
         /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
         RabbitMQOptions GetOptions(string configId = "default");
+
+        /// <summary>
+        /// 预热所有集群的连接池，预先创建所有配置的 TCP 连接
+        /// 避免启动时集中创建连接导致的瞬时压力，提高系统启动稳定性
+        /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
+        /// <returns>表示异步预热操作的任务</returns>
+        Task WarmupAllAsync(CancellationToken cancellationToken = default);
     }
 }

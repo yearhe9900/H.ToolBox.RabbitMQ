@@ -2,6 +2,7 @@ using H.ToolBox.RabbitMQ.Model;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
+using System;
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Threading;
@@ -39,6 +40,11 @@ namespace H.ToolBox.RabbitMQ.Channel
         public bool IsPublishConfirms => _isPublishConfirms;
 
         /// <summary>
+        /// 连接数量，高吞吐场景下多连接可分摊 AMQP 帧处理压力，避免单 TCP 连接成为瓶颈
+        /// </summary>
+        public int ConnectionCount => _connectionCount;
+
+        /// <summary>
         /// 通道池，每个条目携带归还时的时间戳（Ticks），用于空闲超时判断
         /// </summary>
         private readonly ConcurrentQueue<(IChannel Channel, long ReturnedAt)> _pool;
@@ -50,7 +56,20 @@ namespace H.ToolBox.RabbitMQ.Channel
         private readonly long _idleTimeoutTicks;
         private readonly Timer? _sweepTimer;
 
-        private IConnection? _connection;
+        /// <summary>
+        /// 连接数量（已在构造函数中归一化到 [1, 64]）
+        /// </summary>
+        private readonly int _connectionCount;
+
+        /// <summary>
+        /// 连接数组，每个槽位持有一条独立的 RabbitMQ TCP 连接
+        /// </summary>
+        private IConnection?[] _connections;
+
+        /// <summary>
+        /// Round-Robin 计数器，用于在多条连接间均匀分发通道创建请求
+        /// </summary>
+        private int _robin = -1;
 
         public ConnectionChannelPool(
             ILogger<ConnectionChannelPool> logger,
@@ -64,10 +83,45 @@ namespace H.ToolBox.RabbitMQ.Channel
             RabbitMQOptions options)
         {
             _logger = logger;
-            _currentMaxSize = options.PoolSize > 0 ? options.PoolSize : DefaultPoolSize;
-            _absoluteMaxSize = options.AbsoluteMaxPoolSize > 0
+
+            // 归一化连接数量到 [1, 64]，避免过多连接压垮 Broker
+            _connectionCount = Math.Max(1, Math.Min(options.ConnectionCount > 0 ? options.ConnectionCount : 1, 64));
+            _connections = new IConnection?[_connectionCount];
+
+            // 计算通道池大小，确保至少等于连接数，以充分利用所有 TCP 连接
+            var configuredPoolSize = options.PoolSize > 0 ? options.PoolSize : DefaultPoolSize;
+            if (configuredPoolSize < _connectionCount)
+            {
+                _logger.LogInformation(
+                    "配置优化：PoolSize ({ConfiguredPoolSize}) 小于 ConnectionCount ({ConnectionCount})，" +
+                    "已自动调整为 {AdjustedPoolSize} 以充分利用所有 TCP 连接。",
+                    configuredPoolSize, _connectionCount, _connectionCount);
+                _currentMaxSize = _connectionCount;
+            }
+            else
+            {
+                _currentMaxSize = configuredPoolSize;
+            }
+
+            // 计算最大通道池大小，确保至少等于当前大小
+            var configuredAbsoluteMaxSize = options.AbsoluteMaxPoolSize > 0
                 ? Math.Max(options.AbsoluteMaxPoolSize, _currentMaxSize)
                 : _currentMaxSize;
+
+            // 如果 AbsoluteMaxPoolSize 小于 ConnectionCount，自动调整
+            if (configuredAbsoluteMaxSize < _connectionCount)
+            {
+                _logger.LogInformation(
+                    "配置优化：AbsoluteMaxPoolSize ({ConfiguredAbsoluteMaxSize}) 小于 ConnectionCount ({ConnectionCount})，" +
+                    "已自动调整为 {AdjustedAbsoluteMaxSize} 以确保动态扩展后能充分利用所有 TCP 连接。",
+                    configuredAbsoluteMaxSize, _connectionCount, _connectionCount * 2);
+                _absoluteMaxSize = _connectionCount * 2;
+            }
+            else
+            {
+                _absoluteMaxSize = configuredAbsoluteMaxSize;
+            }
+
             _minSize = Math.Max(0, Math.Min(options.MinPoolSize, _currentMaxSize));
             _idleTimeoutTicks = options.IdleTimeout.Ticks;
             _pool = new ConcurrentQueue<(IChannel, long)>();
@@ -84,29 +138,60 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
-        /// 异步获取连接，如果连接不存在或已关闭则创建新连接
+        /// 异步获取一个可用的 RabbitMQ 连接。
+        /// 通过 Round-Robin 在多条连接间均匀分发；若选中槽位的连接不存在或已关闭，则按需创建新连接。
+        /// 连接采用懒创建策略，首次租借通道 / 创建消费通道时才会真正建立 TCP 连接。
         /// </summary>
         public async Task<IConnection> GetConnectionAsync(CancellationToken cancellationToken = default)
         {
-            lock (_connectionLock)
+            // 每个槽位最多尝试重建一次（再叠加一次兜底），避免底层 activator 异常时陷入死循环
+            var maxAttempts = _connectionCount * 2 + 1;
+            IConnection? resolved = null;
+
+            for (var attempt = 0; attempt < maxAttempts && resolved == null; attempt++)
             {
-                if (_connection != null && _connection.IsOpen) return _connection;
+                int idx;
+                IConnection? candidate;
+                lock (_connectionLock)
+                {
+                    idx = (_robin = (_robin + 1) % _connectionCount);
+                    candidate = _connections[idx];
+                }
+
+                if (candidate != null && candidate.IsOpen)
+                {
+                    resolved = candidate;
+                    break;
+                }
+
+                // 该槽位连接不存在或已关闭，创建新连接
+                var connection = await _connectionActivator().ConfigureAwait(false);
+
+                lock (_connectionLock)
+                {
+                    var existing = _connections[idx];
+                    if (existing == null || !existing.IsOpen)
+                    {
+                        existing?.Dispose();
+                        _connections[idx] = connection;
+                    }
+                    else
+                    {
+                        // 并发下已有其它线程完成重建，丢弃本次多余连接
+                        connection.Dispose();
+                    }
+
+                    resolved = _connections[idx];
+                }
             }
 
-            var connection = await _connectionActivator().ConfigureAwait(false);
-            lock (_connectionLock)
+            if (resolved == null)
             {
-                if (_connection == null || !_connection.IsOpen)
-                {
-                    _connection?.Dispose();
-                    _connection = connection;
-                }
-                else
-                {
-                    connection.Dispose();
-                }
-                return _connection;
+                throw new InvalidOperationException(
+                    $"无法为连接通道池建立可用的 RabbitMQ 连接（已尝试 {maxAttempts} 次）。请检查 Broker 地址与凭据配置。");
             }
+
+            return resolved;
         }
 
         /// <summary>
@@ -130,6 +215,11 @@ namespace H.ToolBox.RabbitMQ.Channel
                 Password = options.Password,
                 VirtualHost = options.VirtualHost,
                 ClientProvidedName = clientProvidedName,
+                // 高并发场景下 broker 响应可能变慢，增加超时时间避免连接创建被误取消
+                HandshakeContinuationTimeout = TimeSpan.FromSeconds(30),
+                ContinuationTimeout = TimeSpan.FromSeconds(30),
+                SocketReadTimeout = TimeSpan.FromSeconds(30),
+                SocketWriteTimeout = TimeSpan.FromSeconds(30),
             };
 
             options.ConnectionFactoryOptions?.Invoke(factory);
@@ -158,7 +248,16 @@ namespace H.ToolBox.RabbitMQ.Channel
                 entry.Channel.Dispose();
             }
 
-            _connection?.Dispose();
+            lock (_connectionLock)
+            {
+                foreach (var conn in _connections)
+                {
+                    try { conn?.Dispose(); }
+                    catch { /* 释放失败忽略 */ }
+                }
+
+                _connections = Array.Empty<IConnection?>();
+            }
         }
 
         /// <summary>
@@ -178,8 +277,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                             return entry.Channel;
                         }
 
-                        var conn = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
-                        return await conn.CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken).ConfigureAwait(false);
+                        return await CreateChannelOnAnyConnectionAsync(cancellationToken).ConfigureAwait(false);
                     }
                     catch
                     {
@@ -211,8 +309,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                         return entry.Channel;
                     }
 
-                    var conn = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
-                    return await conn.CreateChannelAsync(new CreateChannelOptions(_isPublishConfirms, false), cancellationToken).ConfigureAwait(false);
+                    return await CreateChannelOnAnyConnectionAsync(cancellationToken).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -220,6 +317,72 @@ namespace H.ToolBox.RabbitMQ.Channel
                     throw;
                 }
             }
+        }
+
+        /// <summary>
+        /// 在任意一条可用连接上创建通道，实现连接级故障转移。
+        /// 某条连接上通道创建失败时，自动将该连接标记为失效并切换到下一条连接重试，
+        /// 直到成功或尝试完所有连接，避免单条连接故障导致整体不可用。
+        /// </summary>
+        private async Task<IChannel> CreateChannelOnAnyConnectionAsync(CancellationToken cancellationToken)
+        {
+            Exception? lastException = null;
+
+            for (var attempt = 0; attempt < _connectionCount; attempt++)
+            {
+                IConnection connection;
+                try
+                {
+                    connection = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    continue;
+                }
+
+                try
+                {
+                    return await connection.CreateChannelAsync(
+                        new CreateChannelOptions(_isPublishConfirms, false),
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    // 只在连接真正断开时才标记为失效并关闭
+                    // 通道创建失败可能是临时网络抖动或 broker 过载，不应盲目关闭整个连接
+                    if (!connection.IsOpen)
+                    {
+                        MarkConnectionFaulted(connection);
+                    }
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"无法在任一 RabbitMQ 连接上创建通道（已尝试 {_connectionCount} 条连接）。", lastException);
+        }
+
+        /// <summary>
+        /// 将指定连接从池中移除并释放，下次获取时自动重建。
+        /// 用于通道创建失败时的连接级故障转移。
+        /// </summary>
+        private void MarkConnectionFaulted(IConnection faulted)
+        {
+            lock (_connectionLock)
+            {
+                for (var i = 0; i < _connections.Length; i++)
+                {
+                    if (ReferenceEquals(_connections[i], faulted))
+                    {
+                        _connections[i] = null;
+                        break;
+                    }
+                }
+            }
+
+            try { faulted.Dispose(); }
+            catch { /* 释放失败忽略 */ }
         }
 
         /// <summary>
@@ -250,7 +413,8 @@ namespace H.ToolBox.RabbitMQ.Channel
 
         /// <summary>
         /// 定时扫描并回收空闲超时的通道
-        /// 保留至少 _minSize 个通道不被回收，避免高峰重建开销
+        /// 保留至少 _minSize 个通道不被回收，避免高峰重建开销。
+        /// 注意：连接本身常驻，不随通道回收而关闭，避免频繁重建 TCP 连接的开销。
         /// </summary>
         private void SweepIdleChannels(object? state)
         {
@@ -316,6 +480,77 @@ namespace H.ToolBox.RabbitMQ.Channel
             {
                 _logger.LogWarning(ex, "空闲通道扫描过程中发生异常");
             }
+        }
+
+        /// <summary>
+        /// 预热连接池，预先创建所有配置的 TCP 连接
+        /// 使用渐进式创建策略，每创建一个连接后短暂延迟，避免瞬间压力过大
+        /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
+        /// <returns>表示异步预热操作的任务</returns>
+        public async Task WarmupAsync(CancellationToken cancellationToken = default)
+        {
+            _logger.LogInformation("开始预热连接池，目标创建 {ConnectionCount} 个连接", _connectionCount);
+
+            var created = 0;
+            var failed = 0;
+
+            for (var i = 0; i < _connectionCount; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    lock (_connectionLock)
+                    {
+                        // 如果该槽位已有打开的连接，跳过
+                        if (_connections[i] != null && _connections[i]!.IsOpen)
+                        {
+                            created++;
+                            continue;
+                        }
+                    }
+
+                    // 创建新连接
+                    var connection = await _connectionActivator().ConfigureAwait(false);
+
+                    lock (_connectionLock)
+                    {
+                        var existing = _connections[i];
+                        if (existing == null || !existing.IsOpen)
+                        {
+                            existing?.Dispose();
+                            _connections[i] = connection;
+                            created++;
+                        }
+                        else
+                        {
+                            // 并发下已有其它线程完成创建，丢弃本次多余连接
+                            connection.Dispose();
+                        }
+                    }
+
+                    // 渐进式创建，避免瞬间压力过大
+                    if (i < _connectionCount - 1)
+                    {
+                        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    _logger.LogWarning(ex, "预热连接池时创建第 {Index} 个连接失败", i + 1);
+
+                    // 失败后增加延迟，避免快速重试导致压力叠加
+                    await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            _logger.LogInformation("连接池预热完成：成功创建 {Created} 个连接，失败 {Failed} 个", created, failed);
         }
     }
 }

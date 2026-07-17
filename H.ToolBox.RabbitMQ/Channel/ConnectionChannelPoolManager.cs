@@ -111,6 +111,59 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
+        /// 预热所有集群的连接池，预先创建所有配置的 TCP 连接
+        /// 使用渐进式创建策略，避免启动时集中创建连接导致的瞬时压力
+        /// </summary>
+        /// <param name="cancellationToken">取消令牌</param>
+        /// <returns>表示异步预热操作的任务</returns>
+        public async Task WarmupAllAsync(CancellationToken cancellationToken = default)
+        {
+            var poolsToWarmup = new List<(string ConfigId, IConnectionChannelPool Pool, bool IsProducer)>();
+
+            // 收集所有需要预热的池
+            foreach (var kvp in _pools)
+            {
+                poolsToWarmup.Add((kvp.Key, kvp.Value, false));
+            }
+            foreach (var kvp in _producerPools)
+            {
+                poolsToWarmup.Add((kvp.Key, kvp.Value, true));
+            }
+
+            if (poolsToWarmup.Count == 0)
+            {
+                return;
+            }
+
+            // 依次预热每个池，避免同时预热多个池导致压力叠加
+            foreach (var (configId, pool, isProducer) in poolsToWarmup)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var poolType = isProducer ? "生产者" : "消费者";
+                try
+                {
+                    await pool.WarmupAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // 预热失败不应阻止应用启动，记录警告即可
+                    _poolLogger.LogWarning(ex, "预热 {PoolType} 连接池（ConfigId: {ConfigId}）失败，将在首次使用时按需创建连接", poolType, configId);
+                }
+
+                // 不同池之间增加延迟，避免同时对 Broker 造成压力
+                if (poolsToWarmup.Count > 1)
+                {
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        /// <summary>
         /// 释放所有连接通道池
         /// </summary>
         public void Dispose()

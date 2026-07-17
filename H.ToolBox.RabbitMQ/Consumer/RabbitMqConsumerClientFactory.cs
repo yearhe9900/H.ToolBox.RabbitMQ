@@ -1,4 +1,5 @@
 ﻿using H.ToolBox.RabbitMQ.Channel;
+using Microsoft.Extensions.Logging;
 
 namespace H.ToolBox.RabbitMQ.Consumer
 {
@@ -9,14 +10,17 @@ namespace H.ToolBox.RabbitMQ.Consumer
     public class RabbitMqConsumerClientFactory : IRabbitMqConsumerClientFactory
     {
         private readonly IConnectionChannelPoolManager _poolManager;
+        private readonly ILoggerFactory _loggerFactory;
 
         /// <summary>
         /// 初始化消费者客户端工厂实例
         /// </summary>
         /// <param name="poolManager">连接通道池管理器</param>
-        public RabbitMqConsumerClientFactory(IConnectionChannelPoolManager poolManager)
+        /// <param name="loggerFactory">日志工厂，用于为消费者客户端创建日志记录器</param>
+        public RabbitMqConsumerClientFactory(IConnectionChannelPoolManager poolManager, ILoggerFactory loggerFactory)
         {
             _poolManager = poolManager;
+            _loggerFactory = loggerFactory;
         }
 
         /// <summary>
@@ -36,7 +40,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         public async Task<IRabbitMqConsumerClient> CreateAsync(string configId)
         {
             var pool = _poolManager.GetPool(configId);
-            var client = new RabbitMqConsumerClient(pool);
+            var logger = _loggerFactory.CreateLogger<RabbitMqConsumerClient>();
+            var client = new RabbitMqConsumerClient(pool, logger);
             await client.ConnectAsync().ConfigureAwait(false);
             return client;
         }

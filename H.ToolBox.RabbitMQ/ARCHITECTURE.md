@@ -280,6 +280,7 @@ classDiagram
         +VirtualHost string
         +ClientProvidedName string
         +PublishConfirms bool
+        +ConnectionCount int
         +PoolSize int
         +AbsoluteMaxPoolSize int
         +MinPoolSize int
@@ -495,7 +496,7 @@ graph LR
 | 类 | 职责 |
 |---|---|
 | `IConnectionChannelPool` | 定义连接和通道的获取/归还接口，`Rent` 支持 `CancellationToken` |
-| `ConnectionChannelPool` | 管理单一 RabbitMQ 连接，使用 `SemaphoreSlim` 实现异步通道租借（替代旧版 `lock+SpinWait` 忙等），`ConcurrentQueue<(IChannel, long)>` 管理通道复用与归还时间戳，支持初始通道数（`PoolSize` 默认15）、动态扩展上限（`AbsoluteMaxPoolSize` 默认128，信号量满时通过 CAS 无锁翻倍扩容）、最小保留数（`MinPoolSize`）、空闲超时回收（`IdleTimeout` 默认60秒，定时器每30秒扫描）、发布确认模式 |
+| `ConnectionChannelPool` | 维护 **多条 RabbitMQ TCP 连接**（`ConnectionCount`，默认 2），通过 Round-Robin 将通道创建请求均匀分摊到各连接，并从根源避免「所有通道共用单条 TCP 连接」的串行阻塞；通道创建具备连接级故障转移。每条连接上仍使用 `SemaphoreSlim` 实现异步通道租借（替代旧版 `lock+SpinWait` 忙等），`ConcurrentQueue<(IChannel, long)>` 管理通道复用与归还时间戳，支持初始通道数（`PoolSize` 默认15）、动态扩展上限（`AbsoluteMaxPoolSize` 默认128，信号量满时通过 CAS 无锁翻倍扩容）、最小保留数（`MinPoolSize`）、空闲超时回收（`IdleTimeout` 默认60秒，定时器每30秒扫描）、发布确认模式 |
 | `CachedDeclareChannel` | 声明缓存装饰器，通过 `ConditionalWeakTable` 给 `IChannel` 附加 `HashSet<string>` 缓存，对同一 exchange/queue 的 `DeclareAsync` 只执行一次，后续跳过，减少发布时的网络往返 |
 | `IConnectionChannelPoolManager` | 连接通道池管理器接口，通过 `GetPool(configId)` 获取指定集群的连接通道池 |
 | `ConnectionChannelPoolManager` | 管理多个集群的连接通道池（`ConcurrentDictionary<string, IConnectionChannelPool>`），支持 `RegisterPool` 注册和 `GetPool` 获取 |
@@ -524,7 +525,7 @@ graph LR
 
 | 类 | 职责 |
 |---|---|
-| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`PoolSize` 初始通道数（默认15）、`AbsoluteMaxPoolSize` 动态扩展上限（默认128）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
+| `RabbitMQOptions` | RabbitMQ 连接配置，含 `ConfigId` 标识集群、`ClientProvidedName` 连接名称、`PublishConfirms` 发布确认、`ConnectionCount` TCP 连接数（默认2，用于分摊单连接阻塞）、`MaxRetries` 发布瞬时故障重试次数（默认3，指数退避，仅对连接/通道中断等可恢复错误生效）、`PoolSize` 初始通道数（默认15）、`AbsoluteMaxPoolSize` 动态扩展上限（默认128）、`MinPoolSize` 最小保留通道数（默认0）、`IdleTimeout` 空闲超时（默认60秒）、`ConnectionFactoryOptions` 自定义工厂配置 |
 | `MethodMatcherCache` | 方法匹配缓存，`TrySetExecutor()` 校验 ConsumerName 唯一性（重复则抛异常），`TrySetExecutor(configId)` 按集群筛选 |
 | `RabbitMQConsumerAttribute` | 消费者特性，含 `ConfigId` 指定消费者绑定的集群、`WaitOneTimeOut` 轮询超时、`ConsumerConcurrent` 并发处理级别、`AckBatchSize` 批量确认累积条数（默认 100）、`AckFlushIntervalMs` 批量确认定时刷新间隔（默认 10） |
 
@@ -574,6 +575,8 @@ graph LR
       "PoolSize": 15,
       "AbsoluteMaxPoolSize": 128,
       "MinPoolSize": 2,
+      "ConnectionCount": 2,
+      "MaxRetries": 3,
       "IdleTimeout": "00:01:00"
     },
     {

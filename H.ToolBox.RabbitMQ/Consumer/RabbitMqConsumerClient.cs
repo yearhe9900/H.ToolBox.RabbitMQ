@@ -1,9 +1,13 @@
 using H.ToolBox.RabbitMQ.Channel;
 using H.ToolBox.RabbitMQ.Model;
 using H.ToolBox.RabbitMQ.Transport;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
 using System.Text;
 
 namespace H.ToolBox.RabbitMQ.Consumer
@@ -37,6 +41,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private readonly IConnectionChannelPool _connectionChannelPool;
 
         /// <summary>
+        /// 日志记录器，用于记录连接重试等信息
+        /// </summary>
+        private readonly ILogger _logger;
+
+        /// <summary>
         /// 当前使用的 RabbitMQ 通道实例
         /// </summary>
         private IChannel? _channel;
@@ -50,9 +59,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// 初始化 RabbitMQ 消费者客户端实例
         /// </summary>
         /// <param name="connectionChannelPool">连接通道池，用于获取 RabbitMQ 连接和创建通道</param>
-        public RabbitMqConsumerClient(IConnectionChannelPool connectionChannelPool)
+        /// <param name="logger">日志记录器</param>
+        public RabbitMqConsumerClient(IConnectionChannelPool connectionChannelPool, ILogger logger)
         {
             _connectionChannelPool = connectionChannelPool;
+            _logger = logger;
         }
 
         /// <summary>
@@ -187,9 +198,14 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
+        /// 瞬时故障重试次数，针对连接/通道创建过程中的可恢复错误
+        /// </summary>
+        private const int MaxConnectRetries = 3;
+
+        /// <summary>
         /// 异步连接到 RabbitMQ 服务器并创建通道
         /// 如果通道不存在或已关闭，则创建新的通道
-        /// 使用信号量确保通道创建过程的线程安全
+        /// 使用信号量确保通道创建过程的线程安全，并支持瞬时故障重试
         /// </summary>
         /// <returns>表示异步连接操作的任务</returns>
         public async Task ConnectAsync()
@@ -204,10 +220,42 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 2. 通道已关闭（需要重建）
                 if (_channel == null || _channel.IsClosed)
                 {
-                    // 从连接池中异步获取一个可用的 RabbitMQ 连接
-                    var connection = await _connectionChannelPool.GetConnectionAsync().ConfigureAwait(false);
-                    // 通过连接创建新的通道
-                    _channel = await connection.CreateChannelAsync().ConfigureAwait(false);
+                    Exception? lastException = null;
+
+                    for (var attempt = 0; attempt <= MaxConnectRetries; attempt++)
+                    {
+                        try
+                        {
+                            // 从连接池中异步获取一个可用的 RabbitMQ 连接
+                            var connection = await _connectionChannelPool.GetConnectionAsync().ConfigureAwait(false);
+                            // 通过连接创建新的通道
+                            _channel = await connection.CreateChannelAsync().ConfigureAwait(false);
+                            return; // 成功，直接返回
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 调用方主动取消，直接抛出
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            lastException = ex;
+
+                            // 仅对瞬时错误重试
+                            if (attempt >= MaxConnectRetries || !IsTransientAmqpException(ex))
+                            {
+                                break;
+                            }
+
+                            // 指数退避后重试（100ms、200ms、400ms …，上限 2s）
+                            var backoffMs = (int)Math.Min(2000, Math.Pow(2, attempt) * 100);
+                            _logger.LogWarning(ex, "消费者通道创建遇到瞬时故障，{Delay}ms 后进行第 {Next} 次重试（共 {Max} 次）。", backoffMs, attempt + 1, MaxConnectRetries);
+                            await Task.Delay(backoffMs).ConfigureAwait(false);
+                        }
+                    }
+
+                    // 重试耗尽，抛出最后一次异常
+                    throw lastException ?? new InvalidOperationException("消费者通道创建失败，原因未知。");
                 }
             }
             finally
@@ -215,6 +263,19 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 释放信号量，允许其他线程访问
                 _semaphore.Release();
             }
+        }
+
+        /// <summary>
+        /// 判断异常是否为可恢复的瞬时 AMQP 错误
+        /// </summary>
+        private static bool IsTransientAmqpException(Exception ex)
+        {
+            return ex is AlreadyClosedException
+                || ex is OperationInterruptedException
+                || ex is BrokerUnreachableException
+                || ex is IOException
+                || ex is SocketException
+                || ex is TimeoutException;
         }
 
         /// <summary>

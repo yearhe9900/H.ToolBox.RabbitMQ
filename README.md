@@ -150,6 +150,8 @@ builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 0);
 | `AbsoluteMaxPoolSize` | 128 | 动态扩展上限，信号量满时自动翻倍扩容，设为0或负数则禁止动态扩展 |
 | `MinPoolSize` | 0 | 空闲回收时至少保留的通道数 |
 | `IdleTimeout` | 60 秒 | 通道空闲超时时间，`TimeSpan.Zero` 禁用回收 |
+| `ConnectionCount` | 2 | 连接（TCP）数量；多连接可将通道与发布请求均匀分摊到多条 TCP 连接，缓解单连接推送阻塞。高吞吐生产者建议 2~4，设为 1 回退单连接行为 |
+| `MaxRetries` | 3 | 发布瞬时故障重试次数（针对连接/通道中断、Broker 不可达、网络 IO 异常、超时等可恢复错误）；指数退避（100/200/400ms…上限 2s）。参数/格式等不可恢复错误不会重试；设为 0 禁用重试 |
 
 ### 3. 创建消费者
 
@@ -314,8 +316,8 @@ public class ConsumerWorker : BackgroundService
 ### 🔧 单集群向后兼容
 原有的 `AddRabbitMQ(options => { ... })` 单集群注册方式完全兼容，不破坏现有代码。
 
-### 🏊 连接通道池复用
-`ConnectionChannelPool` 使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用，避免频繁创建销毁通道。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（初始通道数）、`AbsoluteMaxPoolSize`（动态扩展上限，信号量满时 CAS 无锁翻倍扩容）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）配置，高峰自动扩容，闲时自动收缩。`OperationCanceledException` 直接向上传播，不被包装为发布失败异常。
+### 🏊 连接通道池复用（多连接）
+`ConnectionChannelPool` 内部维护 **多条 RabbitMQ TCP 连接**（`ConnectionCount`，默认 2），所有通道通过 Round-Robin 均匀分摊到各连接上，从根本上消除「所有通道共用单条 TCP 连接」带来的 AMQP 帧串行处理阻塞问题。每条连接上仍使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用；通道创建还具备**连接级故障转移**，某条连接异常时自动切换并重建。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（初始通道数）、`AbsoluteMaxPoolSize`（动态扩展上限，信号量满时 CAS 无锁翻倍扩容）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）、`ConnectionCount`（TCP 连接数）配置，高峰自动扩容，闲时自动收缩。`OperationCanceledException` 直接向上传播，不被包装为发布失败异常。
 
 ### 📡 自动声明与绑定
 消费者启动时自动声明队列/交换机并绑定（交换机模式），设置 QoS 预取数量，开发者无需关心基础设施初始化。

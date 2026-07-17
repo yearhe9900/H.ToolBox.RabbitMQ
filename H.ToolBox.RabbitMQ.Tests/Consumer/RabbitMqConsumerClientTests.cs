@@ -1,6 +1,7 @@
 using H.ToolBox.RabbitMQ.Channel;
 using H.ToolBox.RabbitMQ.Consumer;
 using H.ToolBox.RabbitMQ.Model;
+using Microsoft.Extensions.Logging;
 using Moq;
 using RabbitMQ.Client;
 
@@ -11,6 +12,7 @@ public class RabbitMqConsumerClientTests
     private readonly Mock<IConnectionChannelPool> _poolMock = new();
     private readonly Mock<IConnection> _connectionMock = new();
     private readonly Mock<IChannel> _channelMock = new();
+    private readonly Mock<ILogger> _loggerMock = new();
 
     public RabbitMqConsumerClientTests()
     {
@@ -25,7 +27,7 @@ public class RabbitMqConsumerClientTests
     public async Task CommitAsync_WhenConsumerIsNull_ShouldThrowInvalidOperation()
     {
         // Arrange - client created but ConnectAsync not called, so _consumer is null
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.CommitAsync(1UL));
@@ -35,7 +37,7 @@ public class RabbitMqConsumerClientTests
     public async Task RejectAsync_WhenConsumerIsNull_ShouldThrowInvalidOperation()
     {
         // Arrange
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.RejectAsync(1UL));
@@ -45,7 +47,7 @@ public class RabbitMqConsumerClientTests
     public async Task CommitAsync_WhenSenderIsNull_ShouldThrowInvalidOperation()
     {
         // Arrange - consumer is null before ListeningAsync, so InvalidOperationException is thrown first
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.CommitAsync(null));
@@ -55,7 +57,7 @@ public class RabbitMqConsumerClientTests
     public async Task RejectAsync_WhenSenderIsNull_ShouldThrowInvalidOperation()
     {
         // Arrange - consumer is null before ListeningAsync, so InvalidOperationException is thrown first
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.RejectAsync(null));
@@ -65,7 +67,7 @@ public class RabbitMqConsumerClientTests
     public void DisposeAsync_WhenChannelIsNull_ShouldNotThrow()
     {
         // Arrange - never connected
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act & Assert
         var exception = Record.Exception(() => client.DisposeAsync().AsTask().Wait());
@@ -76,7 +78,7 @@ public class RabbitMqConsumerClientTests
     public async Task ConnectAsync_CalledTwice_ShouldReuseExistingChannel()
     {
         // Arrange
-        var client = new RabbitMqConsumerClient(_poolMock.Object);
+        var client = new RabbitMqConsumerClient(_poolMock.Object, _loggerMock.Object);
 
         // Act
         await client.ConnectAsync();

@@ -21,6 +21,7 @@ public class RabbitMqTransportTests
     public RabbitMqTransportTests()
     {
         _poolManagerMock.Setup(pm => pm.GetProducerPool(It.IsAny<string>())).Returns(_poolMock.Object);
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>())).Returns(_options.Value);
         _poolMock.Setup(p => p.Rent(It.IsAny<CancellationToken>())).ReturnsAsync(_channelMock.Object);
         _poolMock.Setup(p => p.IsPublishConfirms).Returns(false);
         _channelMock.Setup(c => c.IsOpen).Returns(true);
@@ -270,7 +271,7 @@ public class RabbitMqTransportTests
     [Fact]
     public async Task SendAsync_OnFailure_ShouldReturnFailedImmediately()
     {
-        // Arrange - 重试已移除，失败后立即返回
+        // Arrange - InvalidOperationException 为非瞬时错误，不会重试，失败后立即返回
         var callCount = 0;
         _channelMock
             .Setup(c => c.BasicPublishAsync(
@@ -296,6 +297,42 @@ public class RabbitMqTransportTests
         Assert.False(result.Succeeded);
         Assert.IsType<PublisherSentFailedException>(result.Exception);
         Assert.Equal(1, callCount);
+    }
+
+    [Fact]
+    public async Task SendAsync_OnTransientAmqpFailure_ShouldRetryThenFail()
+    {
+        // Arrange - 底层 IO/网络中断（The AMQP operation was interrupted 的典型成因）属于瞬时错误，应触发重试
+        // 将 MaxRetries 设为 2，预期共尝试 1（首次）+ 2（重试）= 3 次
+        var retryOptions = Options.Create(new RabbitMQOptions { MaxRetries = 2 });
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>())).Returns(retryOptions.Value);
+
+        var callCount = 0;
+        _channelMock
+            .Setup(c => c.BasicPublishAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<BasicProperties>(), It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                callCount++;
+                throw new IOException("Already closed: The AMQP operation was interrupted");
+            });
+
+        var transport = CreateTransport();
+        var message = new TransportMessage(new byte[] { 1 }) { QueueName = "q" };
+
+        // Act
+        var result = await transport.SendAsync(message);
+
+        // Assert - 达到重试上限后返回失败，且每次重试都重新租借通道
+        Assert.False(result.Succeeded);
+        Assert.Equal(3, callCount);
+        _poolMock.Verify(p => p.Rent(It.IsAny<CancellationToken>()), Times.Exactly(3));
+        Assert.IsType<PublisherSentFailedException>(result.Exception);
+
+        // 还原 GetOptions 默认行为，避免影响其它测试
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>())).Returns(_options.Value);
     }
 
     [Fact]

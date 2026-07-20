@@ -1,6 +1,7 @@
 using H.ToolBox.RabbitMQ.Consumer;
 using H.ToolBox.RabbitMQ.Model;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Moq;
 
 namespace H.ToolBox.RabbitMQ.Tests.Consumer;
@@ -9,6 +10,7 @@ public class ConsumerServiceSelectorTests
 {
     private readonly Mock<IServiceProvider> _serviceProviderMock = new();
     private readonly Mock<ILogger<ConsumerServiceSelector>> _loggerMock = new();
+    private readonly Mock<IOptions<ConfigConsumerOptions>> _configConsumerOptionsMock = new();
 
     private ConsumerServiceSelector CreateSelector(IEnumerable<IToolBoxRabbitMQ> services)
     {
@@ -16,7 +18,11 @@ public class ConsumerServiceSelectorTests
             .Setup(sp => sp.GetService(typeof(IEnumerable<IToolBoxRabbitMQ>)))
             .Returns(services);
 
-        return new ConsumerServiceSelector(_serviceProviderMock.Object, _loggerMock.Object);
+        _configConsumerOptionsMock
+            .Setup(x => x.Value)
+            .Returns(new ConfigConsumerOptions());
+
+        return new ConsumerServiceSelector(_serviceProviderMock.Object, _loggerMock.Object, _configConsumerOptionsMock.Object);
     }
 
     [Fact]

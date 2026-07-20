@@ -1,6 +1,6 @@
 # H.ToolBox.RabbitMQ
 
-基于 .NET 的 RabbitMQ 消费者/生产者工具库，通过 **特性标记 + 自动扫描** 的方式，让你用最少的代码完成 RabbitMQ 消费者和生产者的集成。支持 **多集群连接**，通过 `ConfigId` 一键切换不同的 MQ 实例。
+基于 .NET 的 RabbitMQ 消费者/生产者工具库，通过 **特性标记 + 自动扫描** 或 **配置驱动** 的方式，让你用最少的代码完成 RabbitMQ 消费者和生产者的集成。支持 **多集群连接**，通过 `ConfigId` 一键切换不同的 MQ 实例。
 
 ---
 
@@ -23,7 +23,7 @@ H.ToolBox.RabbitMQ/
 |---|---|---|
 | **连接池** | `ConnectionChannelPool` | 管理单集群的 RabbitMQ 连接和通道复用，SemaphoreSlim 异步租借，支持空闲回收和声明缓存 |
 | **连接池管理** | `ConnectionChannelPoolManager` | 管理多集群连接池，按 `ConfigId` 路由 |
-| **消费者扫描** | `ConsumerServiceSelector` | 反射扫描 `IToolBoxRabbitMQ` 实现类中的 `[RabbitMQConsumer]` 标记方法 |
+| **消费者扫描** | `ConsumerServiceSelector` | 反射扫描 `IToolBoxRabbitMQ` 和 `IConfigConsumer` 实现类，支持特性驱动和配置驱动两种模式 |
 | **方法缓存** | `MethodMatcherCache` | 缓存 ConsumerName → 方法映射，启动时校验唯一性 |
 | **消费者注册** | `RabbitConsumerRegister` | 单实例统一管理所有集群的消费者，按各自 `ConfigId` 自动路由 |
 | **消费者客户端** | `RabbitMqConsumerClient` | 负责连接、声明队列/交换机、QoS、持续监听消息 |
@@ -36,7 +36,11 @@ H.ToolBox.RabbitMQ/
 
 ## 设计思路
 
-### 核心理念：特性标记 + 自动扫描
+### 核心理念：两种消费者注册模式
+
+本库支持两种消费者注册模式，开发者可根据场景选择：
+
+#### 模式一：特性标记 + 自动扫描（传统方式）
 
 不需要手动创建消费者实例、声明队列、绑定交换机。只需：
 
@@ -45,6 +49,16 @@ H.ToolBox.RabbitMQ/
 3. 一行代码注册服务
 
 框架自动完成：扫描 → 缓存 → 创建客户端 → 声明资源 → 持续监听 → 反射调用。
+
+#### 模式二：配置驱动（新方式）
+
+适用于需要通过配置文件动态管理消费者的场景：
+
+1. 实现 `IConfigConsumer` 标记接口
+2. 在 `appsettings.json` 中配置消费者信息
+3. 注册服务并加载配置
+
+配置驱动模式支持在不修改代码的情况下，通过配置文件调整消费者的队列、集群等参数。
 
 ### 多集群架构
 
@@ -107,8 +121,11 @@ H.ToolBox.RabbitMQ/
 ### 2. 注册服务
 
 ```csharp
-// 注册消费者类
+// 注册特性驱动消费者类
 builder.Services.AddSingleton<IToolBoxRabbitMQ, MyService>();
+
+// 注册配置驱动消费者类
+builder.Services.AddSingleton<IConfigConsumer, ConfigConsumerService>();
 
 // 注册 RabbitMQ 多集群
 builder.Services.AddRabbitMQ(configs =>
@@ -121,6 +138,9 @@ builder.Services.AddRabbitMQ(configs =>
             configs.Add(config);
     }
 });
+
+// 注册配置驱动消费者配置（从 appsettings.json 读取）
+builder.Services.AddConfigConsumer(builder.Configuration);
 ```
 
 单集群兼容模式：
@@ -155,6 +175,8 @@ builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 0);
 
 ### 3. 创建消费者
 
+#### 模式一：特性驱动消费者
+
 ```csharp
 public class MyService : IToolBoxRabbitMQ
 {
@@ -183,6 +205,55 @@ public class MyService : IToolBoxRabbitMQ
     {
         Console.WriteLine($"收到通知消息: {source}");
     }
+}
+```
+
+#### 模式二：配置驱动消费者
+
+```csharp
+// 消费者类实现 IConfigConsumer 接口，无需在方法上添加特性
+public class ConfigConsumerService : IConfigConsumer
+{
+    public async Task<bool> HandleOrder(string source, string routingKey)
+    {
+        Console.WriteLine($"收到订单消息: {source}");
+        return true; // true=确认, false=拒绝
+    }
+
+    public async Task<bool> HandleLog(string source, string routingKey)
+    {
+        Console.WriteLine($"收到日志消息: {source}");
+        return true;
+    }
+}
+```
+
+配置文件 `appsettings.json`：
+
+```json
+{
+  "ConfigConsumer": {
+    "Consumers": [
+      {
+        "ConfigId": "default",
+        "QueueName": "order.queue",
+        "ClassName": "MyNamespace.ConfigConsumerService",
+        "MethodName": "HandleOrder",
+        "ConsumerName": "order.consumer",
+        "AutoAck": false,
+        "Durable": true,
+        "ListenerCount": 1,
+        "PrefetchCount": 100
+      },
+      {
+        "ConfigId": "cluster2",
+        "QueueName": "log.queue",
+        "ClassName": "MyNamespace.ConfigConsumerService",
+        "MethodName": "HandleLog",
+        "ConsumerName": "log.consumer"
+      }
+    ]
+  }
 }
 ```
 
@@ -305,10 +376,35 @@ public class ConsumerWorker : BackgroundService
 
 ---
 
+## 配置驱动消费者配置项
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `ConfigId` | string | "default" | 集群配置标识，对应 RabbitMQOptions.ConfigId |
+| `QueueName` | string | 必填 | 要消费的队列名称 |
+| `ClassName` | string | 必填 | 消费者类的完整类型名（命名空间.类名） |
+| `MethodName` | string | 必填 | 消费者方法名 |
+| `ConsumerName` | string | 自动生成 | 消费者名称，默认为 "类名.方法名" |
+| `Exchange` | string | null | 交换机名称，用于交换机模式 |
+| `ExchangeType` | string | null | 交换机类型（direct/fanout/topic/headers） |
+| `RoutingKey` | string | null | 路由键 |
+| `Durable` | bool | true | 队列/交换机是否持久化 |
+| `AutoAck` | bool | false | 是否自动确认消息 |
+| `PrefetchCount` | ushort | 50 | 预取消息数量 |
+| `ListenerCount` | int | 1 | 并发消费者实例数 |
+| `WaitOneTimeOut` | int | 30 | 监听超时时间（秒） |
+| `ConsumerConcurrent` | byte | 1 | 消息并发处理级别 |
+| `QueueType` | QueueType | Classic | 队列类型（Classic/Quorum） |
+| `QuorumGroupSize` | int | 0 | 仲裁队列副本数 |
+| `Exclusive` | bool | false | 是否独占队列 |
+| `AutoDelete` | bool | false | 是否自动删除 |
+
+---
+
 ## 设计优点
 
 ### 🔌 零代码消费注册
-实现 `IToolBoxRabbitMQ` 接口 + 方法上标记 `[RabbitMQConsumer]` 特性，框架自动扫描注册，无需手写一行连接、声明、监听代码。
+实现 `IToolBoxRabbitMQ` 接口 + 方法上标记 `[RabbitMQConsumer]` 特性，或实现 `IConfigConsumer` 接口 + 配置文件，框架自动扫描注册，无需手写一行连接、声明、监听代码。
 
 ### 🌐 多集群原生支持
 通过 `ConfigId` 一个属性，即可将不同消费者绑定到不同 MQ 集群，生产者也能按 `ConfigId` 发送到任意集群。配置以数组形式管理，新增集群只需添加一个配置项。

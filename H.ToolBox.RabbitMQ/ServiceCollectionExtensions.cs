@@ -3,6 +3,7 @@ using H.ToolBox.RabbitMQ.Consumer;
 using H.ToolBox.RabbitMQ.Model;
 using H.ToolBox.RabbitMQ.Serializer;
 using H.ToolBox.RabbitMQ.Transport;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -95,7 +96,7 @@ namespace H.ToolBox.RabbitMQ
                 return manager;
             });
 
-            // 注册消费者服务选择器：扫描 IToolBoxRabbitMQ 实现类中的 [RabbitMQConsumer] 特性方法
+            // 注册消费者服务选择器：扫描 IToolBoxRabbitMQ 和 IConfigConsumer 实现类
             services.TryAddSingleton<IConsumerServiceSelector, ConsumerServiceSelector>();
 
             // 注册消息序列化器（TryAdd：用户可在调用 AddRabbitMQ 前注册自定义实现以覆盖默认值）
@@ -135,6 +136,54 @@ namespace H.ToolBox.RabbitMQ
                 });
                 services.AddHostedService(sp => sp.GetRequiredService<TransportCheckProcessor>());
             }
+        }
+
+        /// <summary>
+        /// 向服务集合中注册配置驱动的 RabbitMQ 消费者服务
+        /// </summary>
+        /// <param name="services">服务集合</param>
+        /// <param name="configuration">配置对象，用于读取 ConfigConsumer 配置节</param>
+        /// <param name="sectionName">配置节名称，默认为 "ConfigConsumer"</param>
+        /// <remarks>
+        /// 此方法会从配置文件中读取 <paramref name="sectionName"/> 节的配置，
+        /// 并注册 <see cref="IConfigConsumer"/> 接口的实现类。
+        /// 配置文件格式示例：
+        /// <code>
+        /// {
+        ///   "ConfigConsumer": {
+        ///     "Consumers": [
+        ///       {
+        ///         "ConfigId": "default",
+        ///         "QueueName": "my.queue",
+        ///         "ClassName": "MyNamespace.MyConsumerClass",
+        ///         "MethodName": "HandleMessage"
+        ///       }
+        ///     ]
+        ///   }
+        /// }
+        /// </code>
+        /// </remarks>
+        public static void AddConfigConsumer(this IServiceCollection services, IConfiguration configuration, string sectionName = "ConfigConsumer")
+        {
+            // 绑定配置
+            var configConsumerOptions = configuration.GetSection(sectionName).Get<ConfigConsumerOptions>();
+            if (configConsumerOptions != null)
+            {
+                services.Configure<ConfigConsumerOptions>(options =>
+                {
+                    options.Consumers = configConsumerOptions.Consumers;
+                });
+            }
+        }
+
+        /// <summary>
+        /// 向服务集合中注册配置驱动的 RabbitMQ 消费者服务（通过委托配置）
+        /// </summary>
+        /// <param name="services">服务集合</param>
+        /// <param name="optionsAction">配置选项委托</param>
+        public static void AddConfigConsumer(this IServiceCollection services, Action<ConfigConsumerOptions> optionsAction)
+        {
+            services.Configure(optionsAction);
         }
     }
 

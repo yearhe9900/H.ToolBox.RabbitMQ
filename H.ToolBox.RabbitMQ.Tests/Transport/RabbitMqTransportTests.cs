@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 
 namespace H.ToolBox.RabbitMQ.Tests.Transport;
 
@@ -23,8 +24,15 @@ public class RabbitMqTransportTests
         _poolManagerMock.Setup(pm => pm.GetProducerPool(It.IsAny<string>())).Returns(_poolMock.Object);
         _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>())).Returns(_options.Value);
         _poolMock.Setup(p => p.Rent(It.IsAny<CancellationToken>())).ReturnsAsync(_channelMock.Object);
-        _poolMock.Setup(p => p.IsPublishConfirms).Returns(false);
         _channelMock.Setup(c => c.IsOpen).Returns(true);
+
+        // BasicPublishAsync 返回 ValueTask（无 bool 结果）；开启 tracking 后 await 即等待 broker ack，
+        // nack / basic.return 以 PublishException 抛出。显式给出完成态，避免 Moq 默认值造成误判。
+        _channelMock.Setup(c => c.BasicPublishAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<BasicProperties>(), It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.CompletedTask);
     }
 
     private RabbitMqTransport CreateTransport() =>
@@ -203,39 +211,122 @@ public class RabbitMqTransportTests
     }
 
     [Fact]
-    public async Task SendAsync_WithPublishConfirms_ShouldCompleteSuccessfully()
+    public async Task SendAsync_WhenBrokerAcks_ShouldSucceed()
     {
-        // Arrange - PublishConfirms 模式下发送消息
-        // PublishConfirmsTracker 尚未实现，confirmTask 为 null，不会等待 ACK
-        // 验证消息能正常发送而不抛出异常
-        _poolMock.Setup(p => p.IsPublishConfirms).Returns(true);
-        _channelMock.Setup(c => c.ChannelNumber).Returns(1);
-        _channelMock.Setup(c => c.GetNextPublishSequenceNumberAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(1UL);
-
+        // Arrange - 默认 setup 返回正常完成的 ValueTask，等价于 broker ack
         var transport = CreateTransport();
-        var message = new TransportMessage(new byte[] { 1 })
-        {
-            QueueName = "q"
-        };
+        var message = new TransportMessage(new byte[] { 1 }) { QueueName = "q" };
 
         // Act
         var result = await transport.SendAsync(message);
 
         // Assert
         Assert.True(result.Succeeded);
+        _poolMock.Verify(p => p.Return(_channelMock.Object), Times.Once);
     }
 
     [Fact]
-    public async Task SendAsync_WithoutPublishConfirms_ShouldNotTrackDeliveryTag()
+    public async Task SendAsync_WhenBrokerNacks_ShouldReturnFailed()
     {
-        // Arrange
-        _poolMock.Setup(p => p.IsPublishConfirms).Returns(false);
+        // Arrange - nack 由客户端抛 PublishException(IsReturn=false)，绝不能再返回 Success
+        // 注意：PublishException 构造函数要求 publishSequenceNumber 非 0
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>()))
+            .Returns(new RabbitMQOptions { MaxRetries = 0 });
+        _channelMock.Setup(c => c.BasicPublishAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<BasicProperties>(), It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new PublishException(1UL, isReturn: false));
+
+        var transport = CreateTransport();
+        var message = new TransportMessage(new byte[] { 1 }) { QueueName = "q" };
+
+        // Act
+        var result = await transport.SendAsync(message);
+
+        // Assert
+        Assert.False(result.Succeeded);
+        Assert.IsType<PublisherSentFailedException>(result.Exception);
+        Assert.IsType<PublishNackedException>(result.Exception!.InnerException);
+        _poolMock.Verify(p => p.Return(_channelMock.Object), Times.Once);
+    }
+
+    [Fact]
+    public async Task SendAsync_WhenBrokerNacks_ShouldRetryUpToMaxRetries()
+    {
+        // Arrange - nack 归类为瞬时错误，按 MaxRetries 重试，且每次都归还通道
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>()))
+            .Returns(new RabbitMQOptions { MaxRetries = 2 });
+
+        var callCount = 0;
+        _channelMock.Setup(c => c.BasicPublishAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<BasicProperties>(), It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                callCount++;
+                throw new PublishException((ulong)callCount, isReturn: false);
+            });
+
+        var transport = CreateTransport();
+        var message = new TransportMessage(new byte[] { 1 }) { QueueName = "q" };
+
+        // Act
+        var result = await transport.SendAsync(message);
+
+        // Assert
+        Assert.False(result.Succeeded);
+        Assert.Equal(3, callCount);
+        Assert.IsType<PublishNackedException>(result.Exception!.InnerException);
+        _poolMock.Verify(p => p.Rent(It.IsAny<CancellationToken>()), Times.Exactly(3));
+        _poolMock.Verify(p => p.Return(_channelMock.Object), Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task SendAsync_WhenMessageIsReturned_ShouldFailWithoutRetry()
+    {
+        // Arrange - basic.return 属于拓扑/路由错误，IsReturn=true 时禁止重试
+        _poolManagerMock.Setup(pm => pm.GetOptions(It.IsAny<string>()))
+            .Returns(new RabbitMQOptions { MaxRetries = 3 });
+
+        var callCount = 0;
+        _channelMock.Setup(c => c.BasicPublishAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(),
+                It.IsAny<BasicProperties>(), It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                callCount++;
+                throw new PublishReturnException(1UL, "NO_ROUTE", exchange: "ex", routingKey: "rk");
+            });
+
         var transport = CreateTransport();
         var message = new TransportMessage(new byte[] { 1 })
         {
-            QueueName = "q"
+            Exchange = "ex",
+            RoutingKey = "rk",
+            Mandatory = true
         };
+
+        // Act
+        var result = await transport.SendAsync(message);
+
+        // Assert
+        Assert.False(result.Succeeded);
+        Assert.Equal(1, callCount);
+        Assert.IsType<PublisherSentFailedException>(result.Exception);
+        Assert.IsType<PublishReturnedException>(result.Exception!.InnerException);
+        _poolMock.Verify(p => p.Rent(It.IsAny<CancellationToken>()), Times.Once);
+        _poolMock.Verify(p => p.Return(_channelMock.Object), Times.Once);
+    }
+
+    [Fact]
+    public async Task SendAsync_ShouldNotTrackDeliveryTagManually()
+    {
+        // Arrange - 发布序列号由客户端 tracking 内部维护，传输层不应手动读取/记录
+        var transport = CreateTransport();
+        var message = new TransportMessage(new byte[] { 1 }) { QueueName = "q" };
 
         // Act
         var result = await transport.SendAsync(message);

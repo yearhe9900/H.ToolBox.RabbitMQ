@@ -40,8 +40,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
         public async Task<IRabbitMqConsumerClient> CreateAsync(string configId)
         {
             var pool = _poolManager.GetPool(configId);
+            // 传入与生产者相同的集群配置，保证死信拓扑参数一致
+            var clusterOptions = _poolManager.GetOptions(configId);
             var logger = _loggerFactory.CreateLogger<RabbitMqConsumerClient>();
-            var client = new RabbitMqConsumerClient(pool, logger);
+            var client = new RabbitMqConsumerClient(pool, logger, clusterOptions);
             await client.ConnectAsync().ConfigureAwait(false);
             return client;
         }

@@ -63,7 +63,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="queueName">要消费的队列名称</param>
         /// <param name="allwaysRunActionTask">
         /// 消息处理回调委托，参数分别为消息体(T)、消息体原始字符串(ea.Body UTF-8)、路由键(RoutingKey)，
-        /// 返回 true 确认消息，false 拒绝消息并重新入队
+        /// 返回 true 确认消息，false 以 requeue:false 拒绝消息使其进入死信队列
         /// </param>
         /// <param name="prefetchCount">预取消息数量（QoS），默认为 50</param>
         /// <param name="autoAck">是否自动确认消息，默认为 false</param>
@@ -92,14 +92,19 @@ namespace H.ToolBox.RabbitMQ.Consumer
             if (string.IsNullOrWhiteSpace(queueName))
                 throw new ArgumentException("队列名称不能为空。", nameof(queueName));
 
-            var pool = _poolManager.GetPool(configId);
+            // 使用 ConsumerService 专用连接池，支持 ConsumerDispatchConcurrency 设置
+            var pool = _poolManager.GetConsumerServicePool(configId);
             var connection = await pool.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
             var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
             await TrackChannelAsync(channel).ConfigureAwait(false);
 
-            // 声明队列（根据队列类型构建参数）
-            var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
+            // 声明死信拓扑并构建业务队列参数：与生产者共用同一份集群配置，保证队列参数一致
+            var clusterOptions = _poolManager.GetOptions(configId);
+            await DeadLetterTopology.EnsureAsync(
+                channel, queueName, queueType, quorumGroupSize, clusterOptions, cancellationToken).ConfigureAwait(false);
+            var queueArguments = DeadLetterTopology.BuildQueueArguments(
+                queueName, queueType, quorumGroupSize, clusterOptions);
 
             await channel.QueueDeclareAsync(
                 queue: queueName,
@@ -149,7 +154,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                            // 业务处理失败：不再无限重投，直接死信
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                     }
                 }
@@ -194,7 +200,7 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// <param name="queueName">要绑定到交换机的队列名称</param>
         /// <param name="allwaysRunActionTask">
         /// 消息处理回调委托，参数分别为消息体(T)、消息体原始字符串(ea.Body UTF-8)、路由键(RoutingKey)，
-        /// 返回 true 确认消息，false 拒绝消息并重新入队
+        /// 返回 true 确认消息，false 以 requeue:false 拒绝消息使其进入死信队列
         /// </param>
         /// <param name="prefetchCount">预取消息数量（QoS），默认为 50</param>
         /// <param name="autoAck">是否自动确认消息，默认为 false</param>
@@ -228,7 +234,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             if (string.IsNullOrWhiteSpace(queueName))
                 throw new ArgumentException("队列名称不能为空。", nameof(queueName));
 
-            var pool = _poolManager.GetPool(configId);
+            // 使用 ConsumerService 专用连接池，支持 ConsumerDispatchConcurrency 设置
+            var pool = _poolManager.GetConsumerServicePool(configId);
             var connection = await pool.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
             var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -243,8 +250,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 arguments: null,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            // 声明队列（根据队列类型构建参数）
-            var queueArguments = QueueArgumentsHelper.BuildArguments(queueType, quorumGroupSize);
+            // 声明死信拓扑并构建业务队列参数：与生产者共用同一份集群配置，保证队列参数一致
+            var clusterOptions = _poolManager.GetOptions(configId);
+            await DeadLetterTopology.EnsureAsync(
+                channel, queueName, queueType, quorumGroupSize, clusterOptions, cancellationToken).ConfigureAwait(false);
+            var queueArguments = DeadLetterTopology.BuildQueueArguments(
+                queueName, queueType, quorumGroupSize, clusterOptions);
 
             await channel.QueueDeclareAsync(
                 queue: queueName,
@@ -301,7 +312,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
                         }
                         else
                         {
-                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: true, cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                            // 业务处理失败：不再无限重投，直接死信
+                            await channel.BasicRejectAsync(ea.DeliveryTag, requeue: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                         }
                     }
                 }

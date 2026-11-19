@@ -81,6 +81,23 @@ namespace H.ToolBox.RabbitMQ.Channel
         public ConnectionChannelPool(
             ILogger<ConnectionChannelPool> logger,
             RabbitMQOptions options)
+            : this(logger, options, CreateConnection(options), startSweepTimer: true)
+        {
+        }
+
+        /// <summary>
+        /// 可注入连接工厂的内部构造函数，供单元测试验证池的信号量不变量，
+        /// 无需真实 RabbitMQ Broker。
+        /// </summary>
+        /// <param name="logger">日志记录器</param>
+        /// <param name="options">连接池配置</param>
+        /// <param name="connectionActivator">连接工厂委托</param>
+        /// <param name="startSweepTimer">是否启动定时空闲扫描；测试时为 false，改用 SweepIdleChannelsNow() 显式触发</param>
+        internal ConnectionChannelPool(
+            ILogger<ConnectionChannelPool> logger,
+            RabbitMQOptions options,
+            Func<Task<IConnection>> connectionActivator,
+            bool startSweepTimer)
         {
             _logger = logger;
 
@@ -127,11 +144,11 @@ namespace H.ToolBox.RabbitMQ.Channel
             _pool = new ConcurrentQueue<(IChannel, long)>();
             _semaphore = new SemaphoreSlim(_currentMaxSize, _absoluteMaxSize);
 
-            _connectionActivator = CreateConnection(options);
+            _connectionActivator = connectionActivator ?? throw new ArgumentNullException(nameof(connectionActivator));
             _isPublishConfirms = options.PublishConfirms;
 
-            // 空闲超时未禁用时启动定时扫描
-            if (_idleTimeoutTicks > 0)
+            // 空闲超时未禁用且需要自动扫描时启动定时扫描
+            if (startSweepTimer && _idleTimeoutTicks > 0)
             {
                 _sweepTimer = new Timer(SweepIdleChannels, null, SweepInterval, SweepInterval);
             }
@@ -215,11 +232,15 @@ namespace H.ToolBox.RabbitMQ.Channel
                 Password = options.Password,
                 VirtualHost = options.VirtualHost,
                 ClientProvidedName = clientProvidedName,
+                // 消费者分发并发度：控制单个 channel 上同时分发给 HandleBasicDeliverAsync 的消息数
+                // 注意：此值仅对 ConsumerService API 生效；RabbitMQConsumer 特性使用 RabbitMqBasicConsumer
+                // 内部的 Task.Run 并发机制，两者不能同时使用，否则会导致并发失控
+                ConsumerDispatchConcurrency = options.ConsumerDispatchConcurrency,
                 // 高并发场景下 broker 响应可能变慢，增加超时时间避免连接创建被误取消
                 HandshakeContinuationTimeout = TimeSpan.FromSeconds(30),
                 ContinuationTimeout = TimeSpan.FromSeconds(30),
                 SocketReadTimeout = TimeSpan.FromSeconds(30),
-                SocketWriteTimeout = TimeSpan.FromSeconds(30),
+                SocketWriteTimeout = TimeSpan.FromSeconds(30)
             };
 
             options.ConnectionFactoryOptions?.Invoke(factory);
@@ -344,7 +365,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                 try
                 {
                     return await connection.CreateChannelAsync(
-                        new CreateChannelOptions(_isPublishConfirms, false),
+                        BuildChannelOptions(_isPublishConfirms),
                         cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -362,6 +383,15 @@ namespace H.ToolBox.RabbitMQ.Channel
             throw new InvalidOperationException(
                 $"无法在任一 RabbitMQ 连接上创建通道（已尝试 {_connectionCount} 条连接）。", lastException);
         }
+
+        /// <summary>
+        /// 构建通道创建选项。
+        /// publisherConfirmationTrackingEnabled 必须与 publisherConfirmationsEnabled 同时开启：
+        /// 关闭 tracking 时 BasicPublishAsync 不会等待 broker 确认，也不会在 nack / basic.return
+        /// 时抛出 PublishException，发布确认形同虚设。
+        /// </summary>
+        internal static CreateChannelOptions BuildChannelOptions(bool publishConfirms) =>
+            new(publishConfirms, publishConfirms);
 
         /// <summary>
         /// 将指定连接从池中移除并释放，下次获取时自动重建。
@@ -416,7 +446,29 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// 保留至少 _minSize 个通道不被回收，避免高峰重建开销。
         /// 注意：连接本身常驻，不随通道回收而关闭，避免频繁重建 TCP 连接的开销。
         /// </summary>
-        private void SweepIdleChannels(object? state)
+        private void SweepIdleChannels(object? state) => SweepIdleChannelsNow();
+
+        /// <summary>
+        /// 当前可用许可数（仅用于测试/诊断，用于验证池的信号量不变量）。
+        /// </summary>
+        internal int AvailablePermits => _semaphore.CurrentCount;
+
+        /// <summary>
+        /// 当前池中空闲通道数（仅用于测试/诊断）。
+        /// </summary>
+        internal int PooledChannelCount => _pool.Count;
+
+        /// <summary>
+        /// 立即执行一次空闲回收，返回被回收的通道数量。
+        /// </summary>
+        /// <remarks>
+        /// 信号量不变量：<c>许可数 = 池容量 - 正在使用的通道数</c>。
+        /// 通道归还时 <see cref="Return"/> 已经 Release 了一次许可；空闲回收只是把池中的
+        /// 物理通道销毁，下次 Rent 发现池为空会按需新建，许可数不应变化。
+        /// 旧实现在回收时又 Release() 一次，导致许可数随每次扫描单调递增，
+        /// 最终触发 SemaphoreFullException 并使池容量上限失效。
+        /// </remarks>
+        internal int SweepIdleChannelsNow()
         {
             try
             {
@@ -424,7 +476,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                 var currentPoolCount = _pool.Count;
 
                 // 当前池中通道数不超过最小保留数，无需回收
-                if (currentPoolCount <= _minSize) return;
+                if (currentPoolCount <= _minSize) return 0;
 
                 // 计算可回收数量
                 var disposableCount = currentPoolCount - _minSize;
@@ -449,7 +501,8 @@ namespace H.ToolBox.RabbitMQ.Channel
                         continue;
                     }
 
-                    // 回收空闲通道
+                    // 回收空闲通道：只销毁物理通道，不再操作信号量
+                    // （归还时许可已经释放，此处 Release 会让许可数膨胀）
                     try
                     {
                         entry.Channel.Dispose();
@@ -458,10 +511,7 @@ namespace H.ToolBox.RabbitMQ.Channel
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "回收空闲通道时发生异常");
-                    }
-                    finally
-                    {
-                        _semaphore.Release();
+                        keepers.Add(entry);
                     }
                 }
 
@@ -475,10 +525,13 @@ namespace H.ToolBox.RabbitMQ.Channel
                 {
                     _logger.LogInformation("已回收 {Count} 个空闲通道，当前池中剩余 {Remaining} 个", disposed, keepers.Count);
                 }
+
+                return disposed;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "空闲通道扫描过程中发生异常");
+                return 0;
             }
         }
 

@@ -16,6 +16,8 @@ namespace H.ToolBox.RabbitMQ.Transport
             Body = body;
             QueueType = QueueType.Classic;
             QuorumGroupSize = null;
+            // net6.0 默认语言版本为 C# 10，struct 构造函数要求显式赋值所有自动属性
+            MessageId = null;
         }
 
         /// <summary>
@@ -88,5 +90,18 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 用于传递给业务方法处理
         /// </summary>
         public string BodyContent { get; set; } = string.Empty;
+
+        /// <summary>
+        /// 获取或设置消息是否为重新投递（由消费侧从 basic.deliver 的 redelivered 标志填充）。
+        /// 业务侧可据此区分首次投递与重投（例如从死信队列重新发布后的消息），
+        /// 从而决定是否跳过副作用不可重复的操作。
+        /// </summary>
+        public bool Redelivered { get; set; } = false;
+
+        /// <summary>
+        /// 获取或设置消息唯一标识（由消费侧从 <c>message-id</c> 属性填充，可能为 null）。
+        /// 用于日志追踪与幂等判断。
+        /// </summary>
+        public string? MessageId { get; set; }
     }
 }

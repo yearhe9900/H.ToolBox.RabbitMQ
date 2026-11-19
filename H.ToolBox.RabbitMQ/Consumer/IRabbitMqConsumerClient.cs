@@ -40,11 +40,18 @@ namespace H.ToolBox.RabbitMQ.Consumer
         Task CommitAsync(object? sender);
 
         /// <summary>
-        /// 异步拒绝消息，消息将被重新入队等待重新消费
+        /// 异步拒绝消息。默认 <c>requeue:false</c>，消息进入死信队列（需启用 DLX），
+        /// 避免毒消息无限重投打满 CPU 和日志。
         /// </summary>
         /// <param name="sender">消息投递标签（deliveryTag），由消息回调传入</param>
+        /// <param name="requeue">
+        /// 是否重新入队。仅在处理瞬时故障且业务侧自行保证重试上限时才应显式传 true。
+        /// </param>
         /// <returns>表示异步拒绝操作的任务</returns>
-        Task RejectAsync(object? sender);
+        /// <remarks>
+        /// 破坏性变更：旧版本无此参数且底层固定 requeue:true；新版默认 false。
+        /// </remarks>
+        Task RejectAsync(object? sender, bool requeue = false);
 
         /// <summary>
         /// 启动消息监听，持续消费指定队列中的消息

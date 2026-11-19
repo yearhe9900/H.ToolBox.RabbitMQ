@@ -97,9 +97,9 @@ H.ToolBox.RabbitMQ 是一个基于 .NET 的 RabbitMQ 消费者/生产者工具�
 **职责**: 缓存消费者名称到方法扫描结果的映射
 
 **特性**:
-- `ConcurrentDictionary<string, MethodScanResult>` 存储
-- 启动时校验 ConsumerName 全局唯一性
-- 自动生成 ConsumerName (类名.方法名)
+- `ConcurrentDictionary<string, MethodScanResult>` 存储，每次启动全量重建并原子替换，清理上批次残留
+- 启动时校验 ConsumerName 全局唯一性，重复则 fail-fast 抛异常（避免同名消费者互相覆盖）
+- 未显式指定时自动生成 ConsumerName（完整类型名.方法名），避免跨类库同名类撞名
 
 **代码位置**: `H.ToolBox.RabbitMQ/Model/MethodMatcherCache.cs`
 
@@ -170,6 +170,11 @@ ExecuteAsync()
 - `ConcurrentDictionary<string, ConnectionChannelPool>` 存储
 - 按 ConfigId 查找对应的连接池
 - 支持动态注册新集群
+- **三组连接池**: 每个集群维护三组独立连接池，提供连接级隔离：
+  - **消费者池** (GetPool): 供 RabbitMQConsumer 使用
+  - **生产者池** (GetProducerPool): 供生产者使用
+  - **ConsumerService 池** (GetConsumerServicePool): 供 IConsumerService 使用，支持 ConsumerDispatchConcurrency 设置
+- 注意：`Rent` / `Return` 与扩容/回收只对生产者池生效；消费侧通过 `GetConnectionAsync()` 创建长生命周期通道，不走通道租借
 
 **代码位置**: `H.ToolBox.RabbitMQ/Channel/ConnectionChannelPoolManager.cs`
 
@@ -254,7 +259,7 @@ ListeningAsync()
 
 #### IConsumerService / ConsumerService
 
-**职责**: 提供简化的消费 API
+**职责**: 提供简化的消费 API（兼容性消费者 API）
 
 **支持模式**:
 1. **队列消费**: `ListenAsync<T>(configId, queueName, callback)`
@@ -264,6 +269,13 @@ ListeningAsync()
 - 泛型支持，自动反序列化
 - 通过 configId 获取 channel
 - 支持取消令牌
+- **独立连接池**: 使用 ConsumerService 专用连接池，与 RabbitMQConsumer 隔离
+- **ConsumerDispatchConcurrency 支持**: 可通过 `RabbitMQOptions.ConsumerDispatchConcurrency` 配置并发分发度
+
+**并发机制说明**:
+- IConsumerService 使用 RabbitMQ.Client 原生的 `ConsumerDispatchConcurrency` 进行并发分发
+- RabbitMQConsumer 使用 `RabbitMqBasicConsumer` 内部的 `Task.Run` 并发机制
+- 两种机制互斥，因此使用独立的连接池隔离
 
 **代码位置**: `H.ToolBox.RabbitMQ/Consumer/ConsumerService.cs`
 
@@ -442,11 +454,18 @@ builder.Services.AddSingleton<IConnectionChannelPoolManager, CustomPoolManager>(
 - 同一 exchange/queue 只声明一次
 - 减少网络往返
 
-### 5. 批量确认
+### 5. 死信队列（DLX）
 
-- `AckBatcher` 累积确认（下一版本）
+- 消费失败统一 `requeue:false`，由 `DeadLetterTopology` 声明 DLX / DLQ / 绑定
+- 拓扑参数由集群级 `RabbitMQOptions` 唯一定义，生产者与消费者共用，避免 `PRECONDITION_FAILED`
+- 可配置：`EnableDeadLetter` / `DeadLetterExchange` / `DeadLetterExchangeType` / `DeadLetterQueueSuffix`
+
+### 6. 批量确认（规划中，尚未实现）
+
+- `AckBatcher` 累积确认（后续版本）
 - `AckBatchSize` 达到阈值批量确认
 - `AckFlushIntervalMs` 定时刷新兜底
+- 当前版本仍为逐条确认，上述参数暂不生效
 
 ---
 
@@ -535,33 +554,26 @@ H.ToolBox.RabbitMQ (核心库)
   ├── Microsoft.Extensions.Hosting.Abstractions
   ├── Microsoft.Extensions.Logging
   └── Microsoft.Extensions.Configuration.Binder
-
-H.ToolBox.RabbitMQ.WorkerService (示例应用)
-  ├── H.ToolBox.RabbitMQ
-  ├── H.ToolBox.RabbitMQ.Application
-  └── Yitter.IdGenerator
 ```
 
 ---
 
 ## 版本演进
 
-### 当前版本: 1.0.4-alpha02
+### 当前版本: 1.0.4-alpha05（以 `H.ToolBox.RabbitMQ.csproj` 为准，未发布到 NuGet）
 
 **已实现功能**:
-- ✅ 特性驱动消费者
-- ✅ 配置驱动消费者
-- ✅ 多集群支持
-- ✅ 连接通道池复用
-- ✅ 多连接分摊
-- ✅ 动态扩容
-- ✅ 健康检查
+- ✅ 特性驱动消费者 / 配置驱动消费者
+- ✅ 多集群支持（多次 `AddRabbitMQ` 合并配置；`AddRabbitMqConsumer<T>()` 显式注册）
+- ✅ 连接通道池复用 / 多连接分摊 / 动态扩容（生产者侧）
+- ✅ Publisher Confirms 与 `nack` / `basic.return` 区分处理
+- ✅ 死信队列（DLX）：消费失败 `requeue:false` + 毒消息隔离
+- ✅ 按实例的健康检查与自动重启
 - ✅ 简化 API
+- ✅ Testcontainers 集成测试基建（无 Docker 自动跳过）
 
-**下一版本计划**:
+**下一版本计划（尚未实现）**:
 - 🔄 批量累积确认 (AckBatcher)
-- 🔄 消息重试机制
-- 🔄 死信队列支持
 - 🔄 监控指标暴露
 
 ---

@@ -2,13 +2,11 @@
 
 ## 1. 项目概述
 
-`H.ToolBox.RabbitMQ` 是一个基于 .NET 的 RabbitMQ 消费者/生产者工具库，采用 **特性标记 + 自动扫描** 的方式，简化 RabbitMQ 消费者的注册与管理。支持 **多集群** 连接，通过 `ConfigId` 区分不同集群，每个集群独立管理连接池，单个注册器统一管理所有集群的消费者。项目包含三个子项目：
+`H.ToolBox.RabbitMQ` 是一个基于 .NET 的 RabbitMQ 消费者/生产者工具库，采用 **特性标记 + 自动扫描** 的方式，简化 RabbitMQ 消费者的注册与管理。支持 **多集群** 连接，通过 `ConfigId` 区分不同集群，每个集群独立管理连接池，单个注册器统一管理所有集群的消费者。
 
 | 子项目 | 用途 |
 |---|---|
 | `H.ToolBox.RabbitMQ` | 核心库，提供消费者注册、连接通道池管理、消息传输等功能，支持多集群 |
-| `H.ToolBox.RabbitMQ.Application` | 示例应用，包含消费者业务逻辑实现 |
-| `H.ToolBox.RabbitMQ.WorkerService` | 示例 Worker 服务，演示如何集成和使用核心库 |
 
 ---
 
@@ -62,14 +60,7 @@ H.ToolBox.RabbitMQ/
 │       ├── RabbitMqTransport.cs                       #   传输实现 (按 ConfigId 路由到不同集群)
 │       └── TransportMessage.cs                        #   传输消息对象 (含 ConfigId)
 │
-├── H.ToolBox.RabbitMQ.Application/                   # 【示例应用】
-│   └── TestClass.cs                                   #   测试消费者类 (多集群消费者示例)
-│
-└── H.ToolBox.RabbitMQ.WorkerService/                 # 【示例 Worker 服务】
-    ├── Program.cs                                     #   程序入口 (多集群 DI 注册)
-    ├── Worker.cs                                      #   Worker 后台服务 (多集群消息发送)
-    ├── ConsumerWorker.cs                              #   消费者测试 (IConsumerService 使用示例)
-    └── appsettings.json                               #   配置文件 (多集群配置数组)
+└── H.ToolBox.RabbitMQ.Tests/                          # 【测试项目】单元测试与集成测试
 ```
 
 ---

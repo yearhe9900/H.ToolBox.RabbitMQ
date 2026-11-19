@@ -18,9 +18,11 @@ namespace H.ToolBox.RabbitMQ.Transport
     public class RabbitMqTransport : IRabbitMqTransport
     {
         /// <summary>
-        /// 默认持久化标志，当消息未显式指定 Durable 时使用此默认值
+        /// 默认持久化标志，当消息未显式指定 Durable 时使用此默认值。
+        /// 必须与消费侧默认 Durable=true 保持一致，否则同一队列的两次声明会因参数不一致
+        /// 触发 RabbitMQ PRECONDITION_FAILED 并关闭通道。
         /// </summary>
-        private readonly bool _durable = false;
+        private readonly bool _durable = true;
 
         /// <summary>
         /// 共享的消息属性实例，所有发送操作复用以减少对象分配
@@ -29,7 +31,7 @@ namespace H.ToolBox.RabbitMQ.Transport
         private static readonly BasicProperties s_basicProperties = new() { DeliveryMode = DeliveryModes.Persistent };
 
         /// <summary>
-        /// 连接通道池管理器，负责维护和分发不同集群的连接通道
+        /// 连接通道池管理器，负责维护和分发不同集群的连接通道池
         /// </summary>
         private readonly IConnectionChannelPoolManager _poolManager;
 
@@ -49,7 +51,7 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="logger">日志记录器，用于记录发送过程中的警告和错误信息</param>
         /// <param name="poolManager">连接通道池管理器，提供按集群标识获取通道的能力</param>
         /// <param name="serializer">消息序列化器，用于将消息对象序列化为字节数组</param>
-        /// <param name="options">RabbitMQ 配置选项</param>
+        /// <param name="options">RabbitMQ 配置选项（保留以兼容既有构造签名）</param>
         public RabbitMqTransport(ILogger<RabbitMqTransport> logger, IConnectionChannelPoolManager poolManager, IMessageSerializer serializer, IOptions<RabbitMQOptions> options)
         {
             _logger = logger;
@@ -64,11 +66,13 @@ namespace H.ToolBox.RabbitMQ.Transport
         ///   2. 根据 ConfigId 获取对应的连接通道池；
         ///   3. 从池中租借通道，根据模式声明队列或交换机；
         ///   4. 设置消息持久化属性并发布消息；
-        ///   5. 若启用了 Publisher Confirm，等待 Broker 确认；
-        ///   6. 发布失败时根据配置进行重试（指数退避）；
+        ///   5. 开启 publisher confirmation tracking 时，await 发布即等待 broker 确认；
+        ///      broker nack 或 mandatory 消息被 basic.return 时客户端抛 PublishException；
+        ///   6. nack 按瞬时故障重试，basic.return 属于拓扑错误不重试；
         ///   7. 无论成功或失败，都将通道归还到池中。
         /// </summary>
         /// <param name="message">传输消息对象，必须包含有效的路由信息和非空消息体</param>
+        /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果，成功返回 <see cref="OperateResult.Success"/>，失败时包含异常和错误详情</returns>
         public async Task<OperateResult> SendAsync(TransportMessage message, CancellationToken cancellationToken = default)
         {
@@ -99,15 +103,16 @@ namespace H.ToolBox.RabbitMQ.Transport
             // 使用独立连接，避免生产者高速发送时的连接级背压影响消费者 ACK
             var connectionChannelPool = _poolManager.GetProducerPool(message.ConfigId);
 
-            // 读取该集群的瞬时故障重试次数（仅对连接/通道中断等可恢复错误生效）
-            var maxRetries = Math.Max(0, _poolManager.GetOptions(message.ConfigId).MaxRetries);
+            // 读取该集群配置：瞬时故障重试次数与死信拓扑参数。
+            // 死信参数必须与消费侧使用同一个 RabbitMQOptions 实例，否则同名队列声明会冲突。
+            var clusterOptions = _poolManager.GetOptions(message.ConfigId);
+            var maxRetries = Math.Max(0, clusterOptions.MaxRetries);
 
             Exception? lastException = null;
 
             for (var attempt = 0; attempt <= maxRetries; attempt++)
             {
                 IChannel? channel = null;
-                Task<bool>? confirmTask = null;
                 try
                 {
                     // 从连接通道池中租借一个可用通道
@@ -123,8 +128,14 @@ namespace H.ToolBox.RabbitMQ.Transport
                     }
                     else
                     {
-                        // 队列模式：根据队列类型构建声明参数
-                        var queueArguments = QueueArgumentsHelper.BuildArguments(message.QueueType, message.QuorumGroupSize);
+                        // 队列模式：先声明死信拓扑（DLX / DLQ / 绑定），再构建业务队列声明参数。
+                        // 生产者与消费者必须使用完全一致的 arguments，否则 RabbitMQ 会返回 PRECONDITION_FAILED。
+                        await DeadLetterTopology.EnsureAsync(
+                            cached, message.QueueName, message.QueueType, message.QuorumGroupSize,
+                            clusterOptions, cancellationToken).ConfigureAwait(false);
+
+                        var queueArguments = DeadLetterTopology.BuildQueueArguments(
+                            message.QueueName, message.QueueType, message.QuorumGroupSize, clusterOptions);
 
                         // 队列模式：首次声明后缓存，后续同参数调用直接跳过
                         await cached.QueueDeclareAsync(message.QueueName, message.Durable ?? _durable, message.Exclusive, message.AutoDelete, message.QueueType, queueArguments, cancellationToken).ConfigureAwait(false);
@@ -139,6 +150,9 @@ namespace H.ToolBox.RabbitMQ.Transport
 
                     var props = s_basicProperties;
 
+                    // RabbitMQ.Client 7.x：通道开启 publisherConfirmationTrackingEnabled 后，
+                    // 此 await 会等待 broker 的 ack；nack / basic.return 时抛 PublishException。
+                    // 若未开启 confirms，则仅写入 socket 后立即返回，保持旧行为。
                     await channel.BasicPublishAsync(
                         exchange: message.Exchange,
                         routingKey: message.RoutingKey,
@@ -148,18 +162,9 @@ namespace H.ToolBox.RabbitMQ.Transport
                         cancellationToken: cancellationToken
                         ).ConfigureAwait(false);
 
-                    // 立即归还 channel 到池，不阻塞等待 ACK，让其他任务可以复用此 channel
+                    // 发布与确认均已完成，通道可安全归还给其他任务复用
                     connectionChannelPool.Return(channel);
                     channel = null; // 避免下方异常处理中重复归还
-
-                    if (confirmTask != null)
-                    {
-                        var ackResult = await confirmTask.ConfigureAwait(false);
-                        if (!ackResult)
-                        {
-                            throw new InvalidOperationException("消息被 Broker 拒绝（NACK）");
-                        }
-                    }
 
                     return OperateResult.Success;
                 }
@@ -167,6 +172,34 @@ namespace H.ToolBox.RabbitMQ.Transport
                 {
                     // 只有当调用方主动取消时才抛出，其他情况（如连接超时）应作为失败处理
                     throw;
+                }
+                catch (PublishException pex)
+                {
+                    // confirmation tracking 开启时，客户端在 nack / basic.return 时抛出此异常。
+                    // IsReturn=true 表示消息未路由（拓扑配置错误），重试无意义；否则是 broker nack，按瞬时故障重试。
+                    lastException = pex.IsReturn
+                        ? new PublishReturnedException(
+                            $"mandatory 消息无法路由到任何队列（basic.return）。Exchange: {message.Exchange}, RoutingKey: {message.RoutingKey}", pex)
+                        : new PublishNackedException("Broker 明确拒绝（basic.nack）了本次发布，消息未被接受。", pex);
+
+                    // 确认失败不代表通道损坏，仍需归还，否则池会泄漏许可
+                    if (channel != null)
+                    {
+                        try { connectionChannelPool.Return(channel); } catch { /* 忽略 */ }
+                        channel = null;
+                    }
+
+                    if (pex.IsReturn || attempt >= maxRetries)
+                    {
+                        _logger.LogError(lastException, "发布确认失败且不可重试，队列: {QueueName}, ConfigId: {ConfigId}",
+                            message.QueueName, message.ConfigId);
+                        break;
+                    }
+
+                    var backoffMs = (int)Math.Min(2000, Math.Pow(2, attempt) * 100);
+                    _logger.LogWarning(lastException, "发布确认失败，{Delay}ms 后进行第 {Next} 次重试（共 {Max} 次）。",
+                        backoffMs, attempt + 1, maxRetries);
+                    await Task.Delay(backoffMs, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -199,7 +232,7 @@ namespace H.ToolBox.RabbitMQ.Transport
                 }
             }
 
-            _logger.LogError(lastException, "消息发布失败（已达重试上限），队列: {QueueName}, ConfigId: {ConfigId}", message.QueueName, message.ConfigId);
+            _logger.LogError(lastException, "消息发布失败（已达重试上限或不可恢复），队列: {QueueName}, ConfigId: {ConfigId}", message.QueueName, message.ConfigId);
 
             var finalException = lastException ?? new InvalidOperationException("消息发布失败，原因未知。");
             var finalWrapperEx = new PublisherSentFailedException(finalException.Message, finalException);
@@ -214,9 +247,9 @@ namespace H.ToolBox.RabbitMQ.Transport
 
         /// <summary>
         /// 判断异常是否为可恢复的瞬时 AMQP 错误。
-        /// 连接/通道在途被关闭（Already closed / The AMQP operation was interrupted）、
-        /// AMQP 操作被中断、Broker 不可达、底层 IO/网络异常、超时均属于可重试范畴；
-        /// 参数校验失败、消息格式错误等不可恢复错误应直接失败，不进行重试。
+        /// 连接/通道在途被关闭、AMQP 操作被中断、Broker 不可达、底层 IO/网络异常、超时，
+        /// 以及 Broker 明确 nack（通常是瞬时内部错误）均属于可重试范畴；
+        /// 参数校验失败、消息格式错误、mandatory 消息被退回等不可恢复错误应直接失败。
         /// </summary>
         private static bool IsTransientAmqpException(Exception ex)
         {
@@ -225,7 +258,8 @@ namespace H.ToolBox.RabbitMQ.Transport
                 || ex is BrokerUnreachableException
                 || ex is IOException
                 || ex is SocketException
-                || ex is TimeoutException;
+                || ex is TimeoutException
+                || ex is PublishNackedException;
         }
 
         /// <summary>
@@ -239,6 +273,7 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="durable">队列是否持久化，默认为 true</param>
         /// <param name="queueType">队列类型，默认为 Classic（经典队列）</param>
         /// <param name="quorumGroupSize">仲裁队列初始组大小，仅当 queueType 为 Quorum 时生效</param>
+        /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
         public async Task<OperateResult> SendAsync<T>(string configId, string queueName, T msg, bool? durable = true, QueueType queueType = QueueType.Classic, int? quorumGroupSize = null, CancellationToken cancellationToken = default) where T : class
         {
@@ -268,7 +303,7 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// <param name="durable">交换机和队列是否持久化，默认为 true</param>
         /// <param name="exchangeType">交换机类型，默认为 Topic（主题交换机），可选值参见 <see cref="ExchangeTypeConst"/></param>
         /// <param name="mandatory">消息无法路由时是否返回给发布者，默认为 false</param>
-        /// <param name="maxRetries">发布失败时的最大重试次数，默认为 null（不重试）</param>
+        /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
         public async Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, bool mandatory = false, CancellationToken cancellationToken = default) where T : class
         {

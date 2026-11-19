@@ -2,6 +2,7 @@
 using H.ToolBox.RabbitMQ.Model;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Linq.Expressions;
 using System.Reflection;
 
@@ -52,9 +53,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private readonly IConnectionChannelPoolManager _poolManager;
 
         /// <summary>
-        /// 取消令牌源，用于控制所有消费者实例的停止
+        /// 取消令牌源，用于控制所有消费者实例的停止。
+        /// 由 <see cref="BuildCts"/> 统一创建/替换，避免 StartAsync 与 ReStartAsync 各自创建导致旧实例泄漏。
         /// </summary>
-        private CancellationTokenSource? _cts = new();
+        private CancellationTokenSource? _cts;
 
         /// <summary>
         /// 外部停止令牌，用于在 ReStartAsync 中创建链接的取消令牌源
@@ -67,11 +69,6 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private readonly List<Task> _consumerTasks = new();
 
         /// <summary>
-        /// 健康状态锁，保护消费者计数器的线程安全
-        /// </summary>
-        private readonly object _healthLock = new();
-
-        /// <summary>
         /// CTS 操作锁，保护 _cts 字段的读写和 Dispose 重入
         /// </summary>
         private readonly object _ctsLock = new();
@@ -82,14 +79,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private bool _disposed;
 
         /// <summary>
-        /// 已启动的消费者总数
+        /// 每个消费者实例的健康状态：key 为实例唯一标识（ConsumerName-索引），value 为是否健康。
+        /// 按实例判定取代原来的聚合计数器，避免"异常时 healthy 与 total 同步递减"导致
+        /// healthy == total 恒成立、IsHealthy() 永真、故障消费者永不重启的问题。
         /// </summary>
-        private int _totalConsumers;
-
-        /// <summary>
-        /// 当前健康的消费者数量（已成功注册且未关闭/取消的）
-        /// </summary>
-        private int _healthyConsumers;
+        private readonly ConcurrentDictionary<string, bool> _consumerHealth = new(StringComparer.Ordinal);
 
         /// <summary>
         /// 是否0消费者（即没有任何消费者方法被扫描到），用于快速判断是否需要执行重启逻辑
@@ -157,6 +151,31 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
+        /// 创建链接到指定令牌的新 CTS，注册停止回调，并在锁外释放旧 CTS。
+        /// StartAsync 与 ReStartAsync 共用此方法，确保每次重建的令牌源行为一致：
+        /// 旧实现在 ReStartAsync 中直接替换 _cts，既没注册 StopConsumers 回调，也没释放旧 CTS。
+        /// </summary>
+        /// <param name="token">要链接的外部取消令牌</param>
+        private void BuildCts(CancellationToken token)
+        {
+            CancellationTokenSource? previous;
+            lock (_ctsLock)
+            {
+                previous = _cts;
+                _cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                // 外部令牌取消时同样要停消费者、等待任务退出，与 StartAsync 行为一致
+                _cts.Token.Register(StopConsumers);
+            }
+
+            // 旧 CTS 的取消回调已在 Pulse() 中同步执行完毕，此处可安全释放
+            if (previous != null)
+            {
+                try { previous.Dispose(); }
+                catch (ObjectDisposedException) { /* 已被其它路径释放 */ }
+            }
+        }
+
+        /// <summary>
         /// 释放资源，取消所有正在运行的消费者并释放 CTS
         /// 通过 _disposed 标志防止重入（CTS 取消回调会触发此方法）
         /// </summary>
@@ -165,12 +184,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
             if (_disposed) return;
             _disposed = true;
 
-            lock (_healthLock)
-            {
-                _zeroConsumers = false;
-                _healthyConsumers = 0;
-                _totalConsumers = 0;
-            }
+            _zeroConsumers = false;
+            _consumerHealth.Clear();
 
             StopConsumers();
 
@@ -182,19 +197,26 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
-        /// 检查消费者是否处于健康状态
-        /// 只有当所有已启动的消费者都健康时才返回 true
+        /// 检查消费者是否处于健康状态：按实例判定，只有全部已启动实例都健康时才返回 true。
         /// </summary>
-        /// <returns>如果所有消费者都健康返回 true，否则返回 false</returns>
+        /// <returns>全部消费者实例健康、或无消费者需要启动时返回 true；任一实例异常返回 false</returns>
+        /// <remarks>
+        /// 旧实现用 _healthyConsumers == _totalConsumers 判断，但任务异常时两个计数器同步递减，
+        /// 等式恒成立，导致 IsHealthy() 永真、故障实例永不重启。现改为按实例维护状态字典：
+        /// 每个实例启动即登记为健康，异常时置为 false，任何一台不健康即触发重启。
+        /// </remarks>
         public bool IsHealthy()
         {
-            lock (_healthLock)
-            {
-                // 如果消费者正在启动中，认为是健康的，避免在启动过程中触发不必要的重启
-                if (_isStarting) return true;
+            // 启动过程中不做判定，避免注册尚未完成就触发重启
+            if (_isStarting) return true;
 
-                return _zeroConsumers ? true : _totalConsumers > 0 && _healthyConsumers == _totalConsumers;
-            }
+            // 没有任何消费者方法需要启动，视为健康（无需重启）
+            if (_zeroConsumers) return true;
+
+            // 期望有消费者却一个都不在运行（全部异常退出/被取消）时也应判定为不健康，
+            // 由健康检查触发重启；否则要求所有已登记实例都健康。
+            // 启动窗口由 _isStarting 覆盖，不会出现"尚未登记"的误判。
+            return !_consumerHealth.IsEmpty && _consumerHealth.Values.All(healthy => healthy);
         }
 
         /// <summary>
@@ -207,14 +229,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         {
             _externalStoppingToken = stoppingToken;
 
-            lock (_ctsLock)
-            {
-                // 创建关联的取消令牌源，当外部停止令牌触发时自动取消
-                _cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-
-                // 注册取消回调，在令牌取消时停止消费者（不释放 CTS，避免重入）
-                _cts.Token.Register(StopConsumers);
-            }
+            // 统一创建链接令牌源并注册停止回调，避免与 ReStartAsync 各自创建导致旧 CTS 泄漏
+            BuildCts(stoppingToken);
 
             _logger.LogDebug("RabbitMQ消费者注册器正在启动...");
 
@@ -240,14 +256,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
             if (!IsHealthy() || force)
             {
-                // 先停止现有消费者
+                // 先停止现有消费者（取消旧 CTS 并等待其任务退出）
                 Pulse();
 
-                // 创建新的取消令牌源，链接到外部停止令牌以确保主机关闭时能传播取消信号
-                lock (_ctsLock)
-                {
-                    _cts = CancellationTokenSource.CreateLinkedTokenSource(_externalStoppingToken);
-                }
+                // 重建链接到外部停止令牌的 CTS：注册停止回调 + 释放旧 CTS
+                BuildCts(_externalStoppingToken);
 
                 // 重新执行消费者注册
                 await ExecuteAsync().ConfigureAwait(false);
@@ -295,23 +308,21 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 // 通过缓存获取所有消费者方法扫描结果
                 var methodScanResults = _selector.TrySetExecutor();
 
-                // 重置健康计数器，为本次启动做准备
-                lock (_healthLock)
-                {
-                    _totalConsumers = 0;
-                    _healthyConsumers = 0;
-                    _zeroConsumers = methodScanResults.IsEmpty;
-                }
+                // 重置按实例的健康状态，为本次启动做准备
+                _consumerHealth.Clear();
+                _zeroConsumers = methodScanResults.IsEmpty;
 
                 foreach (var methodScanResult in methodScanResults)
                 {
-                    var attr = methodScanResult.Value.ConsumerAttribute;
+                    // 显式把执行器绑定到本次启动的消费者，不再依赖 consumerTag 字符串回退查找
+                    var executorForTag = methodScanResult.Value;
+                    var attr = executorForTag.ConsumerAttribute;
 
                     if (attr == null)
                         continue;
 
                     // 编译委托，替代反射调用，提升消息处理性能
-                    CompileDelegate(methodScanResult.Value);
+                    CompileDelegate(executorForTag);
 
                     // 获取此消费者绑定的集群 ConfigId
                     var configId = attr.ConfigId ?? "default";
@@ -325,10 +336,14 @@ namespace H.ToolBox.RabbitMQ.Consumer
                             var consumerConfigId = configId;
                             var consumerIndex = i;
 
-                            lock (_healthLock)
-                            {
-                                _totalConsumers++;
-                            }
+                            // 为每个消费者实例生成唯一的 consumer tag（RabbitMQ 要求同一连接内 tag 唯一）
+                            // 格式: ConsumerName-索引（多实例时追加后缀，单实例保持原名）
+                            var consumerTag = attr.ListenerCount > 1
+                                ? $"{attr.ConsumerName}-{consumerIndex}"
+                                : attr.ConsumerName ?? string.Empty;
+
+                            // 启动即登记该实例为健康；后续由任务生命周期/日志事件更新
+                            _consumerHealth[consumerTag] = true;
 
                             // 在独立的 Task 中启动每个消费者实例，避免阻塞注册流程
                             var task = Task.Run(async () =>
@@ -339,14 +354,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                     // 通过消费者的 ConfigId 创建对应集群的客户端
                                     await using var client = await _rabbitMqConsumerClientFactory.CreateAsync(consumerConfigId).ConfigureAwait(false);
 
-                                    // 注册消息处理和日志回调
-                                    RegisterMessageProcessor(client);
-
-                                    // 为每个消费者实例生成唯一的 consumer tag（RabbitMQ 要求同一连接内 tag 唯一）
-                                    // 格式: ConsumerName-索引（多实例时追加后缀，单实例保持原名）
-                                    var consumerTag = attr.ListenerCount > 1
-                                        ? $"{attr.ConsumerName}-{consumerIndex}"
-                                        : attr.ConsumerName ?? string.Empty;
+                                    // 注册消息处理和日志回调：执行器由启动时直接绑定，避免同名类库互相串台
+                                    RegisterMessageProcessor(client, executorForTag, consumerTag);
 
                                     // 启动消息监听，此方法会阻塞直到取消令牌被触发
                                     await client.ListeningAsync(
@@ -373,17 +382,16 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                 }
                                 catch (OperationCanceledException)
                                 {
-                                    // 正常取消，不需要标记为不健康
+                                    // 正常停机/重启导致的取消，移除实例登记，不再参与健康判定
+                                    _consumerHealth.TryRemove(consumerTag, out _);
                                 }
                                 catch (Exception ex)
                                 {
-                                    // 消费者任务异常（如连接断开），同步递减两个计数器使比率可自愈
-                                    lock (_healthLock)
-                                    {
-                                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
-                                        _totalConsumers = Math.Max(0, _totalConsumers - 1);
-                                    }
-                                    _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})", attr.ConsumerName, consumerConfigId);
+                                    // 消费者任务异常（如连接断开）：仅将该实例标记为不健康，
+                                    // 不再像旧实现那样同步递减 total 与 healthy（那会让 IsHealthy 永真）。
+                                    // 保留条目使 IsHealthy() 返回 false，由 TransportCheckProcessor 触发重启。
+                                    _consumerHealth[consumerTag] = false;
+                                    _logger.LogError(ex, "消费者 {ConsumerName} 运行异常 (ConfigId: {ConfigId})，已标记为不健康", attr.ConsumerName, consumerConfigId);
                                 }
                             });
 
@@ -409,44 +417,36 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
-        /// 处理消费者日志事件
-        /// 根据日志类型更新消费者健康状态并记录相应的日志信息
+        /// 处理消费者日志事件，按实例更新健康状态并记录日志
         /// </summary>
+        /// <param name="consumerTag">触发该事件的消费者实例标识</param>
         /// <param name="logmsg">日志事件参数，包含日志类型和原因信息</param>
-        private void WriteLog(LogMessageEventArgs logmsg)
+        private void WriteLog(string consumerTag, LogMessageEventArgs logmsg)
         {
             switch (logmsg.LogType)
             {
                 case MqLogType.ConsumerCancelled:
-                    // 消费者被服务器取消，减少健康计数
-                    lock (_healthLock)
-                    {
-                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
-                    }
+                    // 服务器取消消费者：标记该实例不健康
+                    _consumerHealth[consumerTag] = false;
                     _logger.LogWarning("RabbitMQ消费者已被取消。 --> {Reason}", logmsg.Reason);
                     break;
                 case MqLogType.ConsumerRegistered:
-                    // 消费者成功注册，增加健康计数
-                    lock (_healthLock)
-                    {
-                        _healthyConsumers++;
-                    }
+                    // 消费者成功注册：标记该实例健康
+                    _consumerHealth[consumerTag] = true;
                     _logger.LogInformation("RabbitMQ消费者已注册。 --> {Reason}", logmsg.Reason);
                     break;
                 case MqLogType.ConsumerUnregistered:
-                    // 消费者取消注册（客户端发起），记录警告日志
+                    // 客户端主动取消注册，记录警告日志；健康状态由任务生命周期决定
                     _logger.LogWarning("RabbitMQ消费者已取消注册。 --> {Reason}", logmsg.Reason);
                     break;
                 case MqLogType.ConsumerShutdown:
-                    // 通道关闭，减少健康计数
-                    lock (_healthLock)
-                    {
-                        _healthyConsumers = Math.Max(0, _healthyConsumers - 1);
-                    }
+                    // 通道关闭：标记该实例不健康
+                    _consumerHealth[consumerTag] = false;
                     _logger.LogWarning("RabbitMQ消费者已关闭。 --> {Reason}", logmsg.Reason);
                     break;
                 default:
-                    throw new ArgumentOutOfRangeException();
+                    _logger.LogDebug("RabbitMQ消费者事件 {LogType}。 --> {Reason}", logmsg.LogType, logmsg.Reason);
+                    break;
             }
         }
 
@@ -455,39 +455,31 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// 当消费者收到消息时，通过反射调用目标方法进行业务处理
         /// </summary>
         /// <param name="client">消费者客户端实例</param>
+        /// <param name="executor">本次启动时直接绑定的方法执行器</param>
+        /// <param name="consumerTag">消费者实例标识，用于将日志事件绑定到具体实例的健康状态</param>
         /// <remarks>
         /// 消息处理流程：
         /// <list type="number">
-        ///   <item><description>通过 <see cref="MethodMatcherCache.TryGetExecutor"/> 根据消费者标签查找对应的方法信息</description></item>
+        ///   <item><description>启动期把 <see cref="MethodScanResult"/> 直接绑定到该消费者，避免按 consumerTag 字符串回退查找</description></item>
         ///   <item><description>使用反射调用目标方法，传入消息内容和路由键作为参数</description></item>
         ///   <item><description>如果目标方法返回 Task，则等待其完成</description></item>
         ///   <item><description>处理成功后调用 <see cref="IRabbitMqConsumerClient.CommitAsync"/> 确认消息</description></item>
-        ///   <item><description>处理失败时记录错误日志并调用 <see cref="IRabbitMqConsumerClient.RejectAsync"/> 拒绝消息</description></item>
+        ///   <item><description>处理失败时记录错误日志并以 requeue:false 拒绝消息，使其进入死信队列</description></item>
         /// </list>
         /// </remarks>
-        private void RegisterMessageProcessor(IRabbitMqConsumerClient client)
+        private void RegisterMessageProcessor(IRabbitMqConsumerClient client, MethodScanResult executor, string consumerTag)
         {
-            // 注册日志回调
-            client.OnLogCallback = WriteLog;
+            // 注册日志回调，绑定当前实例标识，使健康事件能落到具体实例
+            client.OnLogCallback = logMsg => WriteLog(consumerTag, logMsg);
 
             // 注册消息处理回调
             client.OnMessageCallback = async (message, sender, consumerTag) =>
             {
                 try
                 {
-                    // 根据消费者标签（consumerTag）查找对应的方法执行器
-                    // 消费者标签格式可能为 "ConsumerName-索引"（多实例），需要回退到原始 ConsumerName 查找
-                    var canFindSubscriber = _selector.TryGetExecutor(consumerTag, out var executor);
-                    if (!canFindSubscriber)
-                    {
-                        // 回退：去掉 "-索引" 后缀再查找
-                        var lastDash = consumerTag.LastIndexOf('-');
-                        if (lastDash > 0)
-                        {
-                            var baseName = consumerTag[..lastDash];
-                            canFindSubscriber = _selector.TryGetExecutor(baseName, out executor);
-                        }
-                    }
+                    // 执行器在启动期由调用方直接绑定，不再按 consumerTag 字符串回退查找：
+                    // 旧写法在多个类库存在同名 ConsumerName 时会把消息路由到错误的实现。
+                    var canFindSubscriber = executor != null;
                     if (canFindSubscriber)
                     {
                         if (executor == null)
@@ -521,8 +513,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
                                     || parameters[0].ParameterType != typeof(string)
                                     || parameters[1].ParameterType != typeof(string))
                                 {
-                                    _logger.LogError("消费者方法 {Method} 签名不符合要求，需要 (string, string) 参数", methodInfo.Name);
-                                    await client.CommitAsync(sender).ConfigureAwait(false);
+                                    // 签名不合法属于配置错误，不能静默 Ack 丢消息；
+                                    // 以 requeue:false 拒绝，让消息进入死信队列保留现场供排查。
+                                    _logger.LogError("消费者方法 {Method} 签名不符合要求，需要 (string, string) 参数，消息将进入死信队列", methodInfo.Name);
+                                    await client.RejectAsync(sender).ConfigureAwait(false);
                                     return;
                                 }
 
@@ -573,14 +567,14 @@ namespace H.ToolBox.RabbitMQ.Consumer
                     }
                     else
                     {
-                        _logger.LogError("未找到消费者方法执行器，无法处理消息。 --> {ConsumerTag}", consumerTag);
+                        _logger.LogError("消费者 {ConsumerTag} 未绑定方法执行器，无法处理消息。", consumerTag);
                         await client.RejectAsync(sender).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
                 {
-                    // 消息处理失败，记录错误并拒绝消息（消息将被重新入队）
-                    _logger.LogError(ex, "处理消息时发生异常");
+                    // 兜底：记录错误并以 requeue:false 拒绝，消息进入死信队列，避免无限重投
+                    _logger.LogError(ex, "处理消息时发生异常，消息将进入死信队列");
                     await client.RejectAsync(sender).ConfigureAwait(false);
                 }
             };

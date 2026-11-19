@@ -13,8 +13,7 @@ H.ToolBox.RabbitMQ/
 │   ├── Consumer/                       # 消费者管理（扫描、注册、客户端）
 │   ├── Model/                          # 数据模型（配置、缓存、扫描结果）
 │   └── Transport/                      # 消息传输（生产者）
-├── H.ToolBox.RabbitMQ.Application/    # 示例消费者实现
-└── H.ToolBox.RabbitMQ.WorkerService/  # 示例 Worker 服务
+└── H.ToolBox.RabbitMQ.Tests/           # 单元测试与集成测试
 ```
 
 ### 核心组件
@@ -172,6 +171,7 @@ builder.Services.AddRabbitMQ(configs => { ... }, checkIntervalSeconds: 0);
 | `IdleTimeout` | 60 秒 | 通道空闲超时时间，`TimeSpan.Zero` 禁用回收 |
 | `ConnectionCount` | 2 | 连接（TCP）数量；多连接可将通道与发布请求均匀分摊到多条 TCP 连接，缓解单连接推送阻塞。高吞吐生产者建议 2~4，设为 1 回退单连接行为 |
 | `MaxRetries` | 3 | 发布瞬时故障重试次数（针对连接/通道中断、Broker 不可达、网络 IO 异常、超时等可恢复错误）；指数退避（100/200/400ms…上限 2s）。参数/格式等不可恢复错误不会重试；设为 0 禁用重试 |
+| `ConsumerDispatchConcurrency` | 1 | 消费者分发并发度，仅对 IConsumerService 有效。设置为大于 1 时，客户端会同时向 ReceivedAsync 回调分发多条消息。RabbitMQConsumer 使用独立的并发机制，此设置不影响它 |
 
 ### 3. 创建消费者
 
@@ -324,7 +324,7 @@ public class ConsumerWorker : BackgroundService
             allwaysRunActionTask: async (body, bodyString, routingKey) =>
             {
                 Console.WriteLine($"[队列消费] Body: {body}, RoutingKey: {routingKey}");
-                return true; // true=Ack, false=Reject并重新入队
+                return true; // true=Ack, false=Reject（不重投，进入死信队列）
             },
             prefetchCount: 10,
             cancellationToken: ct);
@@ -357,7 +357,7 @@ public class ConsumerWorker : BackgroundService
 | 第 1 个参数 | `T` | 消息体反序列化后的对象（`string` 类型返回 UTF-8 字符串，`byte[]` 返回原始字节，其他类型 JSON 反序列化） |
 | 第 2 个参数 | `string` | 消息体原始字符串（`ea.Body` 的 UTF-8 编码） |
 | 第 3 个参数 | `string` | 路由键（RoutingKey） |
-| 返回值 | `Task<bool>` | `true` 确认消息（Ack），`false` 拒绝消息（Reject）并重新入队 |
+| 返回值 | `Task<bool>` | `true` 确认消息（Ack），`false` 拒绝消息（Reject）且不重投，进入死信队列（需启用 DLX） |
 
 **可选参数：**
 
@@ -369,10 +369,8 @@ public class ConsumerWorker : BackgroundService
 | `exclusive` | false | 是否独占队列 |
 | `autoDelete` | false | 是否自动删除 |
 | `consumerTag` | "" | 消费者标签（空则由 RabbitMQ 自动生成） |
-| `ackBatchSize` | 100 | 批量确认累积条数，达到即 flush；`<=0` 退化为逐条确认 |
-| `ackFlushIntervalMs` | 10 | 批量确认定时刷新间隔（毫秒），低吞吐兜底；`<=0` 退化为逐条确认 |
 
-> **说明**：`ackBatchSize` / `ackFlushIntervalMs` 自下一版本迭代（见 `PLAN.md`）起生效，声明式消费通过 `[RabbitMQConsumer(AckBatchSize, AckFlushIntervalMs)]` 配置，命令式消费通过 `IConsumerService` 同名可选参数配置。
+> **规划中（尚未实现）**：`ackBatchSize` / `ackFlushIntervalMs` 批量累积确认计划在后续版本加入，当前版本**不生效**。配置它们不会影响现有行为。
 
 ---
 
@@ -415,6 +413,15 @@ public class ConsumerWorker : BackgroundService
 ### 🏊 连接通道池复用（多连接）
 `ConnectionChannelPool` 内部维护 **多条 RabbitMQ TCP 连接**（`ConnectionCount`，默认 2），所有通道通过 Round-Robin 均匀分摊到各连接上，从根本上消除「所有通道共用单条 TCP 连接」带来的 AMQP 帧串行处理阻塞问题。每条连接上仍使用 `SemaphoreSlim` + `ConcurrentQueue` 实现异步通道租借与复用；通道创建还具备**连接级故障转移**，某条连接异常时自动切换并重建。`CachedDeclareChannel` 对同一 exchange/queue 的声明操作只执行一次，减少发布时网络往返。支持 `PoolSize`（初始通道数）、`AbsoluteMaxPoolSize`（动态扩展上限，信号量满时 CAS 无锁翻倍扩容）、`MinPoolSize`（最小保留数）、`IdleTimeout`（空闲超时回收）、`ConnectionCount`（TCP 连接数）配置，高峰自动扩容，闲时自动收缩。`OperationCanceledException` 直接向上传播，不被包装为发布失败异常。
 
+**三组连接池**：每个集群维护三组独立连接池，实现生产者与消费者、以及不同消费者 API 之间的 TCP 连接隔离：
+- **消费者池**（GetPool）：供 `RabbitMQConsumer` 使用
+- **生产者池**（GetProducerPool）：供生产者使用，避免生产者高速发送时通过共享连接压制消费者 ACK 吞吐量
+- **ConsumerService 池**（GetConsumerServicePool）：供 `IConsumerService` 使用，支持 `ConsumerDispatchConcurrency` 设置
+
+> **通道复用范围**：`Rent` / `Return`、`PoolSize` 动态扩容与 `IdleTimeout` 空闲回收**仅对生产者池生效**。消费者侧（`RabbitMqConsumerClient` 与 `ConsumerService`）通过 `GetConnectionAsync()` 获取连接后创建长生命周期通道并持续监听，不走通道租借/归还，因此这些通道池参数不影响消费侧。三组池主要提供**连接级隔离**，而非三组都在做通道复用。
+
+> **并发机制说明**：`IConsumerService` 使用 RabbitMQ.Client 原生的 `ConsumerDispatchConcurrency` 进行并发分发；`RabbitMQConsumer` 使用 `RabbitMqBasicConsumer` 内部的 `Task.Run` 并发机制。两种机制互斥，因此使用独立的连接池隔离。
+
 ### 📡 自动声明与绑定
 消费者启动时自动声明队列/交换机并绑定（交换机模式），设置 QoS 预取数量，开发者无需关心基础设施初始化。
 
@@ -431,10 +438,12 @@ public class ConsumerWorker : BackgroundService
 `RabbitMqConsumerClientFactory` 通过 `IConnectionChannelPoolManager` 按 ConfigId 自动选择对应集群的连接池创建客户端，上层代码无需感知底层集群差异。
 
 ### 📨 消息持久化与确认机制
-默认开启消息持久化（`DeliveryModes.Persistent`）和手动确认（`AutoAck = false`），确保消息不丢失。处理成功后自动 Ack，处理失败自动 Reject 并重新入队。
+默认开启消息持久化（`DeliveryModes.Persistent`）和手动确认（`AutoAck = false`）。处理成功后 Ack；处理失败以 `requeue:false` 拒绝，消息进入由 `DeadLetterTopology` 声明的死信交换机/队列（集群级配置 `EnableDeadLetter` / `DeadLetterExchange` / `DeadLetterQueueSuffix`），避免毒消息无限重投。
 
-### 📦 批量累积确认（AckBatcher）
-消费确认（ACK）由新增的 `AckBatcher` 组件统一调度（下一版本迭代，详见 `PLAN.md`）：在单个 channel 上维护「已确认连续 deliveryTag 区间」，当累积完成的消息达到 `AckBatchSize`（默认 100）或距上次刷新超过 `AckFlushIntervalMs`（默认 10ms）任一条件触发时，发送一次 `BasicAckAsync(maxTag, multiple:true)` 累积确认，将高吞吐场景下的 AMQP 确认帧数量降低 1~2 个数量级。并发乱序完成（`ConsumerConcurrent > 1`）时，依据完成顺序补齐连续前缀，避免 `multiple:true` 误确认未处理消息；Reject 前会先 flush 连续 ACK，再单独拒绝（multiple:false）。`<=0` 时退化为逐条确认，便于灰度。
+### 💀 死信队列（DLX）
+消费失败、方法签名不合法、消费者异常退出等场景统一走 `requeue:false`，消息进入 `<业务队列>.dlq`（后缀可配）。死信拓扑由集群级 `RabbitMQOptions` 唯一定义，生产者与消费者共用同一套参数，避免声明参数不一致触发 `PRECONDITION_FAILED`。
+
+> **规划中（尚未实现）**：批量累积确认 `AckBatcher` 计划在后续版本加入——在单个 channel 上维护连续 deliveryTag 区间，达到 `AckBatchSize` 或 `AckFlushIntervalMs` 阈值时以 `multiple:true` 一次性确认，降低高吞吐下的 ACK 帧数量。当前版本仍为逐条确认。
 
 ### 🔗 多主机集群支持
 `HostName` 支持配置多个地址，实现 RabbitMQ 集群的高可用和负载均衡。

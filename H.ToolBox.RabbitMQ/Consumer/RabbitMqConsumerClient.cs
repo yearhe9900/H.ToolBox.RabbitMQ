@@ -46,6 +46,11 @@ namespace H.ToolBox.RabbitMQ.Consumer
         private readonly ILogger _logger;
 
         /// <summary>
+        /// 当前集群的配置，用于构建与生产者一致的死信拓扑参数
+        /// </summary>
+        private readonly RabbitMQOptions _options;
+
+        /// <summary>
         /// 当前使用的 RabbitMQ 通道实例
         /// </summary>
         private IChannel? _channel;
@@ -60,10 +65,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// </summary>
         /// <param name="connectionChannelPool">连接通道池，用于获取 RabbitMQ 连接和创建通道</param>
         /// <param name="logger">日志记录器</param>
-        public RabbitMqConsumerClient(IConnectionChannelPool connectionChannelPool, ILogger logger)
+        /// <param name="options">集群配置；为 null 时使用默认配置（仍会启用默认死信拓扑）</param>
+        public RabbitMqConsumerClient(IConnectionChannelPool connectionChannelPool, ILogger logger, RabbitMQOptions? options = null)
         {
             _connectionChannelPool = connectionChannelPool;
             _logger = logger;
+            _options = options ?? new RabbitMQOptions();
         }
 
         /// <summary>
@@ -93,16 +100,17 @@ namespace H.ToolBox.RabbitMQ.Consumer
         }
 
         /// <summary>
-        /// 拒绝消息，消息将被重新入队等待重新消费
+        /// 拒绝消息。默认 requeue:false，消息进入死信队列，避免毒消息无限循环重投。
         /// 将拒绝操作委托给内部的 <see cref="RabbitMqBasicConsumer"/> 执行
         /// </summary>
         /// <param name="sender">消息投递标签（deliveryTag）</param>
+        /// <param name="requeue">是否重新入队；默认 false</param>
         /// <returns>表示异步拒绝操作的任务</returns>
-        public async Task RejectAsync(object? sender)
+        public async Task RejectAsync(object? sender, bool requeue = false)
         {
             if (_consumer is null) throw new InvalidOperationException("消费者未初始化或已释放。");
             if (sender is null) throw new ArgumentNullException(nameof(sender));
-            await _consumer.BasicReject((ulong)sender).ConfigureAwait(false);
+            await _consumer.BasicReject((ulong)sender, requeue).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -145,8 +153,14 @@ namespace H.ToolBox.RabbitMQ.Consumer
             var queueName = options.QueueName;
             var consumerConcurrent = options.ConsumerConcurrent ;
 
-            // 根据队列类型构建声明参数
-            var queueArguments = QueueArgumentsHelper.BuildArguments(options.QueueType, options.QuorumGroupSize);
+            // 先声明死信拓扑，再用同一份 RabbitMQOptions 构建业务队列声明参数。
+            // 生产者也会声明同一队列，参数必须完全一致，否则会触发 PRECONDITION_FAILED。
+            await DeadLetterTopology.EnsureAsync(
+                _channel!, options.QueueName!, options.QueueType, options.QuorumGroupSize,
+                _options, cancellationToken).ConfigureAwait(false);
+
+            var queueArguments = DeadLetterTopology.BuildQueueArguments(
+                options.QueueName!, options.QueueType, options.QuorumGroupSize, _options);
 
             if (isExchangeMode)
             {

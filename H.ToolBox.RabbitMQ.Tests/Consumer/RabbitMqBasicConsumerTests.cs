@@ -3,6 +3,7 @@ using H.ToolBox.RabbitMQ.Model;
 using H.ToolBox.RabbitMQ.Transport;
 using Moq;
 using RabbitMQ.Client;
+using System.Text;
 
 namespace H.ToolBox.RabbitMQ.Tests.Consumer;
 
@@ -81,6 +82,62 @@ public class RabbitMqBasicConsumerTests
 
         // Assert
         _channelMock.Verify(c => c.BasicRejectAsync(It.IsAny<ulong>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task BasicReject_ByDefault_ShouldNotRequeue()
+    {
+        // Arrange - 毒消息策略：默认 requeue:false，消息进入 DLX
+        _channelMock.Setup(c => c.IsOpen).Returns(true);
+        var consumer = new RabbitMqBasicConsumer(_channelMock.Object, 0, _msgCallback, _logCallback, isAutoAck: false);
+
+        // Act
+        await consumer.BasicReject(1UL);
+
+        // Assert
+        _channelMock.Verify(c => c.BasicRejectAsync(1UL, false, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task BasicReject_WithExplicitRequeue_ShouldPassThrough()
+    {
+        // Arrange - 只有调用方显式要求时才重投
+        _channelMock.Setup(c => c.IsOpen).Returns(true);
+        var consumer = new RabbitMqBasicConsumer(_channelMock.Object, 0, _msgCallback, _logCallback, isAutoAck: false);
+
+        // Act
+        await consumer.BasicReject(1UL, requeue: true);
+
+        // Assert
+        _channelMock.Verify(c => c.BasicRejectAsync(1UL, true, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task HandleBasicDeliverAsync_ShouldPropagateDeliveryMetadata()
+    {
+        // Arrange - redelivered / message-id / exchange 必须透传给业务侧
+        TransportMessage? captured = null;
+        Func<TransportMessage, object?, string, Task> msgCb = (msg, tag, ct) =>
+        {
+            captured = msg;
+            return Task.CompletedTask;
+        };
+        var propsMock = new Mock<IReadOnlyBasicProperties>();
+        propsMock.Setup(p => p.MessageId).Returns("msg-1");
+
+        var consumer = new RabbitMqBasicConsumer(_channelMock.Object, 0, msgCb, _logCallback);
+
+        // Act
+        await consumer.HandleBasicDeliverAsync("tag", 7UL, true, "ex", "rk",
+            propsMock.Object, Encoding.UTF8.GetBytes("body"));
+
+        // Assert
+        Assert.NotNull(captured);
+        Assert.True(captured!.Value.Redelivered);
+        Assert.Equal("msg-1", captured.Value.MessageId);
+        Assert.Equal("ex", captured.Value.Exchange);
+        Assert.Equal("rk", captured.Value.RoutingKey);
+        Assert.Equal("body", captured.Value.BodyContent);
     }
 
     [Fact]

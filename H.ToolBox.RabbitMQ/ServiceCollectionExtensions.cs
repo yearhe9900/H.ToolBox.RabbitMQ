@@ -6,6 +6,7 @@ using H.ToolBox.RabbitMQ.Transport;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
 namespace H.ToolBox.RabbitMQ
@@ -20,6 +21,60 @@ namespace H.ToolBox.RabbitMQ
     /// </remarks>
     public static class ServiceCollectionExtensions
     {
+        /// <summary>
+        /// 注册一个 <see cref="IToolBoxRabbitMQ"/> 消费者实现（多类库场景推荐入口）。
+        /// </summary>
+        /// <typeparam name="T">实现了 <see cref="IToolBoxRabbitMQ"/> 的消费者类型</typeparam>
+        /// <param name="services">服务集合</param>
+        /// <returns>服务集合本身，便于链式调用</returns>
+        /// <remarks>
+        /// 消费者发现依赖 <c>GetServices&lt;IToolBoxRabbitMQ&gt;()</c>，它只返回 ServiceType
+        /// 就是 <see cref="IToolBoxRabbitMQ"/> 的注册。若各业务类库用
+        /// <c>TryAddSingleton&lt;IToolBoxRabbitMQ, T&gt;()</c>，TryAdd 会按 ServiceType 判重，
+        /// 导致只有最早注入的一个实现能被发现；若用
+        /// <c>AddSingleton&lt;T&gt;()</c> 按具体类型注册，则一个都发现不了。
+        /// 本方法按 (ServiceType, ImplementationType) 判重，保证每个实现类都被注册一次。
+        /// 已通过程序集扫描兜底兼容按具体类型注册的旧写法。
+        /// </remarks>
+        public static IServiceCollection AddRabbitMqConsumer<T>(this IServiceCollection services)
+            where T : class, IToolBoxRabbitMQ
+        {
+            if (services == null) throw new ArgumentNullException(nameof(services));
+
+            var alreadyRegistered = services.Any(d =>
+                d.ServiceType == typeof(IToolBoxRabbitMQ) && d.ImplementationType == typeof(T));
+
+            if (!alreadyRegistered)
+            {
+                services.AddSingleton<IToolBoxRabbitMQ, T>();
+            }
+
+            return services;
+        }
+
+        /// <summary>
+        /// 注册一个 <see cref="IConfigConsumer"/> 消费者实现（配置驱动场景，语义同
+        /// <see cref="AddRabbitMqConsumer{T}(IServiceCollection)"/>）。
+        /// </summary>
+        /// <typeparam name="T">实现了 <see cref="IConfigConsumer"/> 的消费者类型</typeparam>
+        /// <param name="services">服务集合</param>
+        /// <returns>服务集合本身</returns>
+        public static IServiceCollection AddConfigConsumerService<T>(this IServiceCollection services)
+            where T : class, IConfigConsumer
+        {
+            if (services == null) throw new ArgumentNullException(nameof(services));
+
+            var alreadyRegistered = services.Any(d =>
+                d.ServiceType == typeof(IConfigConsumer) && d.ImplementationType == typeof(T));
+
+            if (!alreadyRegistered)
+            {
+                services.AddSingleton<IConfigConsumer, T>();
+            }
+
+            return services;
+        }
+
         /// <summary>
         /// 向服务集合中注册 RabbitMQ 所需的所有服务（单集群模式，兼容旧版本）
         /// </summary>
@@ -84,12 +139,26 @@ namespace H.ToolBox.RabbitMQ
             if (duplicates.Count > 0)
                 throw new ArgumentException($"存在重复的 ConfigId: {string.Join(", ", duplicates)}");
 
-            // 注册连接通道池管理器（Singleton），负责管理所有集群的连接池
+            // 把本次配置合并进共享注册表：多次调用 AddRabbitMQ（例如各业务类库各自注册）
+            // 时，早期实现只捕获第一次的 collection，后续集群会被静默丢弃。
+            var registry = services
+                .FirstOrDefault(d => d.ServiceType == typeof(RabbitMqClusterConfiguration))?
+                .ImplementationInstance as RabbitMqClusterConfiguration;
+
+            if (registry == null)
+            {
+                registry = new RabbitMqClusterConfiguration();
+                services.AddSingleton(registry);
+            }
+
+            registry.Merge(collection.Configs);
+
+            // 注册连接通道池管理器（Singleton），在容器构建时读取合并后的完整配置
             services.TryAddSingleton<IConnectionChannelPoolManager>(sp =>
             {
                 var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ConnectionChannelPool>>();
                 var manager = new ConnectionChannelPoolManager(logger);
-                foreach (var config in collection.Configs)
+                foreach (var config in sp.GetRequiredService<RabbitMqClusterConfiguration>().Configs)
                 {
                     manager.RegisterPool(config.ConfigId, config);
                 }
@@ -115,26 +184,31 @@ namespace H.ToolBox.RabbitMQ
             // 注册方法匹配缓存，缓存消费者名称到扫描结果的映射，避免重复反射扫描
             services.TryAddSingleton<MethodMatcherCache>();
 
-            // 注册单一的消费者注册器，内部根据消费者的 ConfigId 自动路由到对应集群
-            services.AddSingleton<IRabbitConsumerRegister, RabbitConsumerRegister>();
+            // 注册单一的消费者注册器（TryAdd：重复调用 AddRabbitMQ 不应产生多个注册器）
+            services.TryAddSingleton<IRabbitConsumerRegister, RabbitConsumerRegister>();
 
-            // 注册 Bootstrapper 为 Singleton，同时作为 HostedService 使用同一实例
-            // 这样可以在 HostedService 和其他服务之间共享同一个 Bootstrapper 实例
-            services.AddSingleton<Bootstrapper>();
-            services.AddHostedService(sp => sp.GetRequiredService<Bootstrapper>());
-
-            // 仅当 checkIntervalSeconds > 0 时注册健康检查处理器
-            if (checkIntervalSeconds > 0)
+            // 基础设施只注册一次：重复 AddRabbitMQ 若产生多个 Bootstrapper / 健康检查器，
+            // 同一个消费者会被启动多次并重复消费消息。
+            var infraAlreadyRegistered = services.Any(d => d.ServiceType == typeof(RabbitMqInfrastructureMarker));
+            if (!infraAlreadyRegistered)
             {
-                var checkInterval = TimeSpan.FromSeconds(checkIntervalSeconds);
-                // 注册传输健康检查处理器为 Singleton，同时作为 HostedService 使用同一实例
-                // 定时检查消费者注册器的健康状态，在不健康时自动重启
-                services.AddSingleton<TransportCheckProcessor>(sp =>
+                services.AddSingleton<RabbitMqInfrastructureMarker>();
+
+                // Bootstrapper 作为 Singleton，同时以同一实例注册为 HostedService
+                services.TryAddSingleton<Bootstrapper>();
+                services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<Bootstrapper>());
+
+                // 仅当 checkIntervalSeconds > 0 时注册健康检查处理器（以首次调用的配置为准）
+                if (checkIntervalSeconds > 0)
                 {
-                    var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TransportCheckProcessor>>();
-                    return new TransportCheckProcessor(sp, logger, checkInterval);
-                });
-                services.AddHostedService(sp => sp.GetRequiredService<TransportCheckProcessor>());
+                    var checkInterval = TimeSpan.FromSeconds(checkIntervalSeconds);
+                    services.TryAddSingleton<TransportCheckProcessor>(sp =>
+                    {
+                        var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TransportCheckProcessor>>();
+                        return new TransportCheckProcessor(sp, logger, checkInterval);
+                    });
+                    services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<TransportCheckProcessor>());
+                }
             }
         }
 
@@ -184,6 +258,51 @@ namespace H.ToolBox.RabbitMQ
         public static void AddConfigConsumer(this IServiceCollection services, Action<ConfigConsumerOptions> optionsAction)
         {
             services.Configure(optionsAction);
+        }
+    }
+
+    /// <summary>
+    /// 防止多次调用 AddRabbitMQ 时重复注册 HostedService 的标记类型。
+    /// </summary>
+    internal sealed class RabbitMqInfrastructureMarker
+    {
+    }
+
+    /// <summary>
+    /// 多次调用 AddRabbitMQ 时共用的一份集群配置注册表。
+    /// 旧实现把第一次调用的 collection 闭包进单例工厂，后续调用新增的集群会被静默丢弃。
+    /// </summary>
+    internal sealed class RabbitMqClusterConfiguration
+    {
+        private readonly object _sync = new();
+        private readonly List<RabbitMQOptions> _configs = new();
+
+        public IReadOnlyList<RabbitMQOptions> Configs
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _configs.ToList();
+                }
+            }
+        }
+
+        public void Merge(IEnumerable<RabbitMQOptions> configs)
+        {
+            lock (_sync)
+            {
+                foreach (var config in configs)
+                {
+                    if (_configs.Any(c => c.ConfigId == config.ConfigId))
+                    {
+                        throw new ArgumentException(
+                            $"存在重复的 ConfigId: {config.ConfigId}（多次调用 AddRabbitMQ 时配置会合并）");
+                    }
+
+                    _configs.Add(config);
+                }
+            }
         }
     }
 

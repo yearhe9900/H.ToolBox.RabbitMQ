@@ -27,6 +27,16 @@ namespace H.ToolBox.RabbitMQ.Channel
         IConnectionChannelPool GetProducerPool(string configId = "default");
 
         /// <summary>
+        /// 根据 ConfigId 获取对应的 ConsumerService 专用连接通道池
+        /// ConsumerService 作为兼容性消费者 API，使用独立的连接池，支持 ConsumerDispatchConcurrency 设置
+        /// 与 RabbitMQConsumer 使用的消费者池隔离，避免并发机制冲突
+        /// </summary>
+        /// <param name="configId">集群配置标识，默认为 "default"</param>
+        /// <returns>对应集群的 ConsumerService 专用连接通道池</returns>
+        /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
+        IConnectionChannelPool GetConsumerServicePool(string configId = "default");
+
+        /// <summary>
         /// 根据 ConfigId 获取对应的 RabbitMQ 配置选项
         /// </summary>
         /// <param name="configId">集群配置标识，默认为 "default"</param>

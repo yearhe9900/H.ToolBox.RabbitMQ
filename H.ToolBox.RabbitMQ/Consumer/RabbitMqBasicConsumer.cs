@@ -135,8 +135,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
             // 构造传输消息对象，将原始字节解码为 UTF-8 字符串
             var message = new TransportMessage(body)
             {
+                Exchange = exchange,
                 RoutingKey = routingKey,
-                BodyContent = Encoding.UTF8.GetString(body.Span)
+                BodyContent = Encoding.UTF8.GetString(body.Span),
+                // 把投递元信息透传给业务侧，便于识别重投消息与做日志追踪
+                Redelivered = redelivered,
+                MessageId = properties.MessageId
             };
             // 调用消息回调，传递消息内容、投递标签（用于后续确认）和消费者标签（用于查找处理器）
             return _msgCallback(message, deliveryTag, consumerTag);
@@ -240,9 +244,12 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// 仅在手动确认模式（非 AutoAck）下生效
         /// </summary>
         /// <param name="deliveryTag">消息投递标签</param>
-        /// <param name="requeue">是否重新入队。为 false 时消息将进入死信队列（需配置 DLX），避免毒消息无限循环</param>
+        /// <param name="requeue">
+        /// 是否重新入队。默认 false，消息进入死信队列（由 <see cref="DeadLetterTopology"/> 声明），
+        /// 避免毒消息无限循环；仅在业务侧能自行保证重试上限时才传 true。
+        /// </param>
         /// <returns>表示异步拒绝操作的任务</returns>
-        public async Task BasicReject(ulong deliveryTag, bool requeue = true)
+        public async Task BasicReject(ulong deliveryTag, bool requeue = false)
         {
             if (Channel is { IsOpen: true } && !_isAutoAck)
                 await Channel.BasicRejectAsync(deliveryTag, requeue).ConfigureAwait(false);

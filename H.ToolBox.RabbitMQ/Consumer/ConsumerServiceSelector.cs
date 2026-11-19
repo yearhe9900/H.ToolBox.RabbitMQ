@@ -11,6 +11,13 @@ namespace H.ToolBox.RabbitMQ.Consumer
     /// 负责扫描所有实现了 <see cref="IToolBoxRabbitMQ"/> 或 <see cref="IConfigConsumer"/> 接口的服务，
     /// 并从中提取带有 <see cref="RabbitMQConsumerAttribute"/> 特性的方法作为消费者候选
     /// </summary>
+    /// <remarks>
+    /// 发现来源有两层：
+    ///   1. DI 容器中以接口 ServiceType 注册的实现（<c>GetServices&lt;IToolBoxRabbitMQ&gt;()</c>）；
+    ///   2. 程序集扫描兜底：以具体类型注册（<c>AddSingleton&lt;MyConsumer&gt;()</c>）的实现，
+    ///      通过 <c>GetService(具体类型)</c> 解析。
+    /// 只做"发现"，不自行 new 实例，避免绕过 DI 生命周期。
+    /// </remarks>
     public class ConsumerServiceSelector : IConsumerServiceSelector
     {
         private readonly ILogger<ConsumerServiceSelector> _logger;
@@ -33,6 +40,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
             _configConsumerOptions = configConsumerOptions.Value;
         }
 
+        /// <summary>
+        /// 扫描特性驱动与配置驱动的消费者候选
+        /// </summary>
+        /// <returns>全部消费者方法扫描结果</returns>
         public IReadOnlyList<MethodScanResult> SelectCandidates()
         {
             var resultList = new List<MethodScanResult>();
@@ -43,6 +54,10 @@ namespace H.ToolBox.RabbitMQ.Consumer
             // 扫描 IConfigConsumer 接口的实现（配置驱动）
             ScanConfigConsumerServices(resultList);
 
+            _logger.LogInformation("消费者扫描完成，共发现 {Count} 个消费者方法，来自 {Types} 个实现类型。",
+                resultList.Count,
+                resultList.Where(r => r.Instance != null).Select(r => r.Instance!.GetType()).Distinct().Count());
+
             return resultList;
         }
 
@@ -51,12 +66,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
         /// </summary>
         private void ScanToolBoxRabbitMQServices(List<MethodScanResult> resultList)
         {
-            var mqServices = _serviceProvider.GetServices<IToolBoxRabbitMQ>();
-
-            foreach (var serviceInstance in mqServices)
+            foreach (var serviceInstance in ResolveImplementations<IToolBoxRabbitMQ>())
             {
-                if (serviceInstance == null) continue;
-
                 var instanceType = serviceInstance.GetType();
 
                 // 找出带 [RabbitMQConsumer] 特性的方法
@@ -87,12 +98,8 @@ namespace H.ToolBox.RabbitMQ.Consumer
                 return;
             }
 
-            var configConsumerServices = _serviceProvider.GetServices<IConfigConsumer>();
-
-            foreach (var serviceInstance in configConsumerServices)
+            foreach (var serviceInstance in ResolveImplementations<IConfigConsumer>())
             {
-                if (serviceInstance == null) continue;
-
                 var instanceType = serviceInstance.GetType();
 
                 // 查找匹配的配置项
@@ -140,6 +147,75 @@ namespace H.ToolBox.RabbitMQ.Consumer
 
                     _logger.LogInformation("配置驱动消费者: 已注册 {ClassName}.{MethodName} -> 队列 {QueueName}",
                         config.ClassName, config.MethodName, config.QueueName);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 合并"按接口注册"与"按具体类型注册"的两种实现，保证多个类库的消费者都能被发现。
+        /// 不会自行创建 DI 未注册的类型实例；按实现类型去重，避免同一实例被扫描两次。
+        /// </summary>
+        private IEnumerable<T> ResolveImplementations<T>() where T : class
+        {
+            var seen = new HashSet<Type>();
+
+            // 直接用 GetService(typeof(IEnumerable<T>))，避免 GetServices<T>() 在
+            // 未注册 IEnumerable<T> 的轻量 IServiceProvider 上抛 InvalidOperationException。
+            var registered = _serviceProvider.GetService(typeof(IEnumerable<T>)) as IEnumerable<T>;
+            if (registered != null)
+            {
+                foreach (var serviceInstance in registered)
+                {
+                    if (serviceInstance == null) continue;
+                    seen.Add(serviceInstance.GetType());
+                    yield return serviceInstance;
+                }
+            }
+
+            // 兜底：按具体类型注册的实现（多类库各自 AddSingleton<MyConsumer>() 的常见写法）
+            foreach (var implementationType in FindImplementationTypes<T>())
+            {
+                if (seen.Contains(implementationType)) continue;
+
+                if (_serviceProvider.GetService(implementationType) is T instance)
+                {
+                    seen.Add(implementationType);
+                    _logger.LogInformation(
+                        "消费者 {Type} 未以 {Interface} 注册，已由程序集扫描兜底发现；建议使用 AddRabbitMqConsumer<T>() 显式注册。",
+                        implementationType.FullName, typeof(T).Name);
+                    yield return instance;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 从已加载程序集中找出 T 的具体实现类型，跳过抽象类型、接口、泛型定义与库自身类型。
+        /// </summary>
+        private static IEnumerable<Type> FindImplementationTypes<T>() where T : class
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type?[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    types = ex.Types;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var type in types)
+                {
+                    if (type == null || type.IsAbstract || type.IsInterface || type.ContainsGenericParameters)
+                        continue;
+
+                    if (typeof(T).IsAssignableFrom(type))
+                        yield return type;
                 }
             }
         }

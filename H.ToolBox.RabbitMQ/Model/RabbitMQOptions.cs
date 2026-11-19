@@ -102,6 +102,18 @@ namespace H.ToolBox.RabbitMQ.Model
         public int ConsumerThreadCount { get; set; } = 1;
 
         /// <summary>
+        /// 消费者分发并发度，控制单个消费者通道上同时分发的消息数量。
+        /// 默认值为 1（串行分发）。设置为大于 1 时，客户端会同时向 ReceivedAsync 回调
+        /// 分发多条消息，配合 prefetchCount 可显著提升慢消费者的吞吐量。
+        /// 建议值：prefetchCount / 2 或与业务处理并发度一致。
+        /// 
+        /// 注意：此设置仅对 IConsumerService（兼容性消费者 API）有效。
+        /// RabbitMQConsumer 使用 RabbitMqBasicConsumer 内部的 Task.Run 并发机制，
+        /// 其连接池的 ConsumerDispatchConcurrency 固定为 1，避免并发机制冲突。
+        /// </summary>
+        public ushort ConsumerDispatchConcurrency { get; set; } = 1;
+
+        /// <summary>
         /// 默认队列类型，控制新声明队列的类型。
         /// Classic 为经典队列（默认），Quorum 为仲裁队列（推荐集群模式使用）。
         /// 可在 <see cref="RabbitMQConsumerAttribute.QueueType"/> 中针对单个消费者覆盖此设置。
@@ -114,6 +126,37 @@ namespace H.ToolBox.RabbitMQ.Model
         /// 建议设置为奇数（如 3、5），且不超过集群节点数。
         /// </summary>
         public int? QuorumGroupSize { get; set; }
+
+        /// <summary>
+        /// 是否启用死信（DLX）拓扑，默认 true。
+        /// 启用后所有队列声明都会附带 <c>x-dead-letter-exchange</c> 与
+        /// <c>x-dead-letter-routing-key</c>，消费失败的消息以 <c>requeue:false</c>
+        /// 拒绝后进入死信队列，避免毒消息无限循环重投。
+        /// </summary>
+        /// <remarks>
+        /// 死信参数是队列级属性：生产者与消费者声明同一队列时必须使用完全一致的参数，
+        /// 否则 RabbitMQ 会返回 PRECONDITION_FAILED。因此该配置按 ConfigId 集群级统一，
+        /// 刻意不提供单消费者覆盖入口。
+        /// </remarks>
+        public bool EnableDeadLetter { get; set; } = true;
+
+        /// <summary>
+        /// 死信交换机名称，默认 "H.ToolBox.dlx"。
+        /// 由所有声明队列的路径统一声明为 durable 的 direct 交换机。
+        /// </summary>
+        public string DeadLetterExchange { get; set; } = "H.ToolBox.dlx";
+
+        /// <summary>
+        /// 死信交换机类型，默认 "direct"。
+        /// 使用 direct 交换机配合队列名作为 routing key，保证每个业务队列有独立的死信队列。
+        /// </summary>
+        public string DeadLetterExchangeType { get; set; } = "direct";
+
+        /// <summary>
+        /// 死信队列名后缀，默认 ".dlq"。
+        /// 业务队列 "order.queue" 对应的死信队列名为 "order.queue.dlq"。
+        /// </summary>
+        public string DeadLetterQueueSuffix { get; set; } = ".dlq";
 
         /// <summary>
         /// 连接工厂自定义配置回调

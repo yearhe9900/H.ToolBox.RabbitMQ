@@ -112,7 +112,9 @@ namespace H.ToolBox.RabbitMQ
                         {
                             try
                             {
-                                await processor.ReStartAsync(force: true).ConfigureAwait(false);
+                                // 使用默认的 force:false：ReStartAsync 内部会再次校验健康状态，
+                                // 避免强制重启把已被其它路径恢复的消费者也一并拆掉重连，造成抖动。
+                                await processor.ReStartAsync().ConfigureAwait(false);
                             }
                             catch (OperationCanceledException)
                             {
@@ -124,7 +126,7 @@ namespace H.ToolBox.RabbitMQ
                     }
                     else
                     {
-                        _logger.LogInformation("检测到消费者注册器健康");
+                        _logger.LogTrace("检测到消费者注册器健康");
                     }
                 }
                 catch (OperationCanceledException)

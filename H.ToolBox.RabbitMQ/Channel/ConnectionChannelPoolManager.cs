@@ -12,6 +12,7 @@ namespace H.ToolBox.RabbitMQ.Channel
     {
         private readonly ConcurrentDictionary<string, IConnectionChannelPool> _pools = new();
         private readonly ConcurrentDictionary<string, IConnectionChannelPool> _producerPools = new();
+        private readonly ConcurrentDictionary<string, IConnectionChannelPool> _consumerServicePools = new();
         private readonly ConcurrentDictionary<string, RabbitMQOptions> _options = new();
         private readonly ILogger<ConnectionChannelPool> _poolLogger;
 
@@ -59,6 +60,24 @@ namespace H.ToolBox.RabbitMQ.Channel
         }
 
         /// <summary>
+        /// 根据 ConfigId 获取对应的 ConsumerService 专用连接通道池
+        /// ConsumerService 作为兼容性消费者 API，使用独立的连接池，支持 ConsumerDispatchConcurrency 设置
+        /// 与 RabbitMQConsumer 使用的消费者池隔离，避免并发机制冲突
+        /// </summary>
+        /// <param name="configId">集群配置标识，默认为 "default"</param>
+        /// <returns>对应集群的 ConsumerService 专用连接通道池</returns>
+        /// <exception cref="KeyNotFoundException">当指定的 ConfigId 未注册时抛出</exception>
+        public IConnectionChannelPool GetConsumerServicePool(string configId = "default")
+        {
+            if (_consumerServicePools.TryGetValue(configId, out var pool))
+            {
+                return pool;
+            }
+
+            throw new KeyNotFoundException($"未找到 ConfigId 为 '{configId}' 的 ConsumerService 连接通道池，请确保已通过 AddRabbitMQ 注册该集群配置。");
+        }
+
+        /// <summary>
         /// 根据 ConfigId 获取对应的 RabbitMQ 配置选项
         /// </summary>
         /// <param name="configId">集群配置标识，默认为 "default"</param>
@@ -87,13 +106,24 @@ namespace H.ToolBox.RabbitMQ.Channel
             if (string.IsNullOrWhiteSpace(configId))
                 throw new ArgumentException("ConfigId 不能为空。", nameof(configId));
 
-            var pool = new ConnectionChannelPool(_poolLogger, options);
-            var producerPool = new ConnectionChannelPool(_poolLogger, options);
+            // 创建消费者池（RabbitMQConsumer 使用），ConsumerDispatchConcurrency 固定为 1
+            // 因为 RabbitMQConsumer 使用 RabbitMqBasicConsumer 内部的 Task.Run 并发机制
+            var consumerOptions = CreateConsumerOptions(options);
+            var pool = new ConnectionChannelPool(_poolLogger, consumerOptions);
+
+            // 创建生产者池，ConsumerDispatchConcurrency 固定为 1（生产者不需要此设置）
+            var producerOptions = CreateProducerOptions(options);
+            var producerPool = new ConnectionChannelPool(_poolLogger, producerOptions);
+
+            // 创建 ConsumerService 专用池，使用原始的 ConsumerDispatchConcurrency 设置
+            // ConsumerService 作为兼容性消费者 API，支持 ConsumerDispatchConcurrency 并发分发
+            var consumerServicePool = new ConnectionChannelPool(_poolLogger, options);
 
             if (!_pools.TryAdd(configId, pool))
             {
                 pool.Dispose();
                 producerPool.Dispose();
+                consumerServicePool.Dispose();
                 throw new InvalidOperationException($"ConfigId 为 '{configId}' 的连接通道池已注册，不可重复注册。");
             }
 
@@ -102,12 +132,83 @@ namespace H.ToolBox.RabbitMQ.Channel
                 _pools.TryRemove(configId, out _);
                 pool.Dispose();
                 producerPool.Dispose();
+                consumerServicePool.Dispose();
                 throw new InvalidOperationException($"ConfigId 为 '{configId}' 的生产者连接通道池已注册，不可重复注册。");
+            }
+
+            if (!_consumerServicePools.TryAdd(configId, consumerServicePool))
+            {
+                _pools.TryRemove(configId, out _);
+                _producerPools.TryRemove(configId, out _);
+                pool.Dispose();
+                producerPool.Dispose();
+                consumerServicePool.Dispose();
+                throw new InvalidOperationException($"ConfigId 为 '{configId}' 的 ConsumerService 连接通道池已注册，不可重复注册。");
             }
 
             _options.TryAdd(configId, options);
 
             return pool;
+        }
+
+        /// <summary>
+        /// 创建消费者池的配置选项，ConsumerDispatchConcurrency 固定为 1
+        /// RabbitMQConsumer 使用 RabbitMqBasicConsumer 内部的 Task.Run 并发机制，不需要 ConsumerDispatchConcurrency
+        /// </summary>
+        private static RabbitMQOptions CreateConsumerOptions(RabbitMQOptions options)
+        {
+            return new RabbitMQOptions
+            {
+                ConfigId = options.ConfigId,
+                HostName = options.HostName,
+                Port = options.Port,
+                UserName = options.UserName,
+                Password = options.Password,
+                VirtualHost = options.VirtualHost,
+                ClientProvidedName = options.ClientProvidedName,
+                PublishConfirms = options.PublishConfirms,
+                PoolSize = options.PoolSize,
+                AbsoluteMaxPoolSize = options.AbsoluteMaxPoolSize,
+                MinPoolSize = options.MinPoolSize,
+                IdleTimeout = options.IdleTimeout,
+                ConnectionCount = options.ConnectionCount,
+                MaxRetries = options.MaxRetries,
+                ConsumerThreadCount = options.ConsumerThreadCount,
+                ConsumerDispatchConcurrency = 1, // 固定为 1，避免与 RabbitMqBasicConsumer 的 Task.Run 冲突
+                DefaultQueueType = options.DefaultQueueType,
+                QuorumGroupSize = options.QuorumGroupSize,
+                ConnectionFactoryOptions = options.ConnectionFactoryOptions
+            };
+        }
+
+        /// <summary>
+        /// 创建生产者池的配置选项，ConsumerDispatchConcurrency 固定为 1
+        /// 生产者不需要 ConsumerDispatchConcurrency 设置
+        /// </summary>
+        private static RabbitMQOptions CreateProducerOptions(RabbitMQOptions options)
+        {
+            return new RabbitMQOptions
+            {
+                ConfigId = options.ConfigId,
+                HostName = options.HostName,
+                Port = options.Port,
+                UserName = options.UserName,
+                Password = options.Password,
+                VirtualHost = options.VirtualHost,
+                ClientProvidedName = options.ClientProvidedName,
+                PublishConfirms = options.PublishConfirms,
+                PoolSize = options.PoolSize,
+                AbsoluteMaxPoolSize = options.AbsoluteMaxPoolSize,
+                MinPoolSize = options.MinPoolSize,
+                IdleTimeout = options.IdleTimeout,
+                ConnectionCount = options.ConnectionCount,
+                MaxRetries = options.MaxRetries,
+                ConsumerThreadCount = options.ConsumerThreadCount,
+                ConsumerDispatchConcurrency = 1, // 生产者不需要此设置
+                DefaultQueueType = options.DefaultQueueType,
+                QuorumGroupSize = options.QuorumGroupSize,
+                ConnectionFactoryOptions = options.ConnectionFactoryOptions
+            };
         }
 
         /// <summary>
@@ -118,16 +219,20 @@ namespace H.ToolBox.RabbitMQ.Channel
         /// <returns>表示异步预热操作的任务</returns>
         public async Task WarmupAllAsync(CancellationToken cancellationToken = default)
         {
-            var poolsToWarmup = new List<(string ConfigId, IConnectionChannelPool Pool, bool IsProducer)>();
+            var poolsToWarmup = new List<(string ConfigId, IConnectionChannelPool Pool, string PoolType)>();
 
             // 收集所有需要预热的池
             foreach (var kvp in _pools)
             {
-                poolsToWarmup.Add((kvp.Key, kvp.Value, false));
+                poolsToWarmup.Add((kvp.Key, kvp.Value, "消费者"));
             }
             foreach (var kvp in _producerPools)
             {
-                poolsToWarmup.Add((kvp.Key, kvp.Value, true));
+                poolsToWarmup.Add((kvp.Key, kvp.Value, "生产者"));
+            }
+            foreach (var kvp in _consumerServicePools)
+            {
+                poolsToWarmup.Add((kvp.Key, kvp.Value, "ConsumerService"));
             }
 
             if (poolsToWarmup.Count == 0)
@@ -136,11 +241,10 @@ namespace H.ToolBox.RabbitMQ.Channel
             }
 
             // 依次预热每个池，避免同时预热多个池导致压力叠加
-            foreach (var (configId, pool, isProducer) in poolsToWarmup)
+            foreach (var (configId, pool, poolType) in poolsToWarmup)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var poolType = isProducer ? "生产者" : "消费者";
                 try
                 {
                     await pool.WarmupAsync(cancellationToken).ConfigureAwait(false);
@@ -185,6 +289,15 @@ namespace H.ToolBox.RabbitMQ.Channel
                 }
             }
             _producerPools.Clear();
+
+            foreach (var kvp in _consumerServicePools)
+            {
+                if (kvp.Value is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+            _consumerServicePools.Clear();
         }
     }
 }

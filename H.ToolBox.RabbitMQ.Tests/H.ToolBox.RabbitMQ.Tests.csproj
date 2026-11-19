@@ -7,6 +7,12 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
+  <!-- 集成测试依赖 Docker。默认启用；无 Docker 环境的机器可用 -p:EnableIntegrationTests=false 完整关闭，
+       关闭时 Integration 目录不参与编译，也不会还原 Testcontainers 包。 -->
+  <PropertyGroup>
+    <EnableIntegrationTests Condition="'$(EnableIntegrationTests)' == ''">true</EnableIntegrationTests>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
     <PackageReference Include="xunit" Version="2.*" />
@@ -19,6 +25,14 @@
 
   <ItemGroup>
     <ProjectReference Include="..\H.ToolBox.RabbitMQ\H.ToolBox.RabbitMQ.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(EnableIntegrationTests)' == 'true'">
+    <PackageReference Include="Testcontainers.RabbitMq" Version="4.16.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(EnableIntegrationTests)' != 'true'">
+    <Compile Remove="Integration/**/*.cs" />
   </ItemGroup>
 
 </Project>

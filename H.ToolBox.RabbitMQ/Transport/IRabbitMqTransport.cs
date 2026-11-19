@@ -16,6 +16,7 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 通过 <see cref="TransportMessage.ConfigId"/> 指定目标集群，默认为 "default"。
         /// </summary>
         /// <param name="message">传输消息对象，包含消息体、路由信息及集群标识</param>
+        /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果，成功返回 <see cref="OperateResult.Success"/>，失败时包含异常和错误详情</returns>
         Task<OperateResult> SendAsync(TransportMessage message, CancellationToken cancellationToken = default);
 
@@ -49,7 +50,6 @@ namespace H.ToolBox.RabbitMQ.Transport
         /// 可选值参见 <see cref="ExchangeTypeConst"/>：Direct、Fanout、Headers、Topic
         /// </param>
         /// <param name="mandatory">消息无法路由时是否返回给发布者，默认为 false</param>
-        /// <param name="maxRetries">发布失败时的最大重试次数，默认为 null（不重试）</param>
         /// <param name="cancellationToken">用于取消操作的令牌</param>
         /// <returns>操作结果</returns>
         Task<OperateResult> SendAsync<T>(string configId, string exchange, string routingKey, T msg, bool? durable = true, string exchangeType = ExchangeTypeConst.Topic, bool mandatory = false,  CancellationToken cancellationToken = default) where T : class;

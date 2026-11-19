@@ -8,7 +8,7 @@ namespace H.ToolBox.RabbitMQ.Channel
 {
     /// <summary>
     /// 带声明缓存的通道装饰器
-    /// 对同一个 exchange/queue 只声明一次，后续调用直接跳过，避免每次发送都产生一次网络往返
+    /// 对同一个 exchange/queue/binding 只声明一次，后续调用直接跳过，避免每次发送都产生一次网络往返
     /// </summary>
     internal sealed class CachedDeclareChannel
     {
@@ -19,11 +19,6 @@ namespace H.ToolBox.RabbitMQ.Channel
 
         private readonly IChannel _channel;
         private readonly HashSet<string> _declared;
-#if NET10_0_OR_GREATER
-        private readonly Lock _declaredLock = new();
-#else
-        private readonly object _declaredLock = new();
-#endif
 
         public CachedDeclareChannel(IChannel channel)
         {
@@ -44,12 +39,10 @@ namespace H.ToolBox.RabbitMQ.Channel
         public async Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken)
         {
             var key = $"e|{exchange}|{type}|{durable}|{autoDelete}";
-            lock (_declaredLock)
-            {
-                if (!_declared.Add(key)) return;
-            }
+            if (IsDeclared(key)) return;
 
             await _channel.ExchangeDeclareAsync(exchange, type, durable, autoDelete, null, false, cancellationToken).ConfigureAwait(false);
+            MarkDeclared(key);
         }
 
         /// <summary>
@@ -58,12 +51,23 @@ namespace H.ToolBox.RabbitMQ.Channel
         public async Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, QueueType queueType, IDictionary<string, object?>? arguments, CancellationToken cancellationToken)
         {
             var key = $"q|{queue}|{durable}|{exclusive}|{autoDelete}|{queueType}|{FormatArguments(arguments)}";
-            lock (_declaredLock)
-            {
-                if (!_declared.Add(key)) return;
-            }
+            if (IsDeclared(key)) return;
 
             await _channel.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, false, cancellationToken).ConfigureAwait(false);
+            MarkDeclared(key);
+        }
+
+        /// <summary>
+        /// 绑定队列到交换机（幂等缓存，同参数只声明一次）
+        /// </summary>
+        public async Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken)
+        {
+            var key = $"b|{queue}|{exchange}|{routingKey}";
+            if (IsDeclared(key)) return;
+
+            await _channel.QueueBindAsync(queue, exchange, routingKey, arguments: null,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            MarkDeclared(key);
         }
 
         /// <summary>
@@ -86,15 +90,32 @@ namespace H.ToolBox.RabbitMQ.Channel
             return _channel.DisposeAsync();
         }
 
+        /// <summary>
+        /// 先声明、成功后才写缓存：声明失败时不能污染缓存，
+        /// 否则后续发布会跳过声明，把消息发往并不存在的拓扑。
+        /// </summary>
+        private bool IsDeclared(string key)
+        {
+            // _declared 按底层 channel 共享，锁必须锁在同一个共享对象上，
+            // 不能用每个包装实例各自持有的锁。
+            lock (_declared)
+            {
+                return _declared.Contains(key);
+            }
+        }
+
+        private void MarkDeclared(string key)
+        {
+            lock (_declared)
+            {
+                _declared.Add(key);
+            }
+        }
+
         private static HashSet<string> GetOrCreateCache(IChannel channel)
         {
-            // ConditionalWeakTable 已线程安全，无需外层锁
-            if (s_caches.TryGetValue(channel, out var existing))
-                return existing;
-
-            var cache = new HashSet<string>(StringComparer.Ordinal);
-            s_caches.Add(channel, cache);
-            return cache;
+            // GetValue 是原子的，避免并发创建时 Add 因键已存在而抛异常
+            return s_caches.GetValue(channel, static _ => new HashSet<string>(StringComparer.Ordinal));
         }
 
         private static string FormatArguments(IDictionary<string, object?>? arguments)
